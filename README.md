@@ -22,8 +22,11 @@ Open <http://localhost:7700/> for the control page: volume, AirPlay status, back
 
 ## Control page
 
-The page in `ui/` is a React app (Vite + Tailwind CSS). Its built output is committed in
-`ui/dist` and embedded into the binary, so `cargo build` has no Node toolchain requirements.
+The page in `ui/` is a React app (Vite + Tailwind CSS), organized in tabs: **Output** (volume +
+AirPlay speakers), **Background** (radio/stream), **Alerts** (send, namespaces, queue) and two
+reference tabs, **MCP Docs** (rendered live from `tools/list`) and **API Docs** (with copyable
+curl examples). Its built output is committed in `ui/dist` and embedded into the binary, so
+`cargo build` has no Node toolchain requirements.
 
 ```sh
 pnpm --dir ui build     # rebuild the embedded page; then build/run the server again

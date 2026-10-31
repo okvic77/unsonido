@@ -1,46 +1,83 @@
-import { useCallback, useState } from "react";
+import { useState } from "react";
 import { AirPlay } from "./components/AirPlay";
 import { AlertsQueue } from "./components/AlertsQueue";
 import { Background } from "./components/Background";
 import { Namespaces } from "./components/Namespaces";
 import { Output } from "./components/Output";
 import { SendAlert } from "./components/SendAlert";
+import { TabBar, loadTab, saveTab, type TabId } from "./components/TabBar";
+import { ApiDocs } from "./components/docs/ApiDocs";
+import { McpDocs } from "./components/docs/McpDocs";
 import { TokenBox } from "./components/TokenBox";
 import { useToasts } from "./components/Toast";
 import { loadToken } from "./api";
-import { useStatus, type ConnectionState } from "./useStatus";
+import { useStatus, type ConnectionState, type Notifier } from "./useStatus";
+import type { Status } from "./types";
+
+/** Every panel stays mounted; a tab switch only hides it, so drafts and
+ * open/closed states survive moving between tabs. */
+function Panels({
+  tab,
+  notify,
+  refresh,
+  status,
+  tokenVersion,
+}: {
+  tab: TabId;
+  notify: Notifier;
+  refresh: () => void;
+  status: Status | null;
+  tokenVersion: string;
+}) {
+  return (
+    <>
+      <div className={"flex flex-col gap-3 sm:gap-4 " + (tab === "output" ? "" : "hidden")}>
+        <Output status={status} notify={notify} />
+        <AirPlay status={status} notify={notify} refresh={refresh} />
+      </div>
+      <div className={tab === "background" ? "" : "hidden"}>
+        <Background status={status} notify={notify} refresh={refresh} />
+      </div>
+      <div className={"flex flex-col gap-3 sm:gap-4 " + (tab === "alerts" ? "" : "hidden")}>
+        <SendAlert key={tokenVersion} notify={notify} refresh={refresh} />
+        <Namespaces status={status} notify={notify} refresh={refresh} />
+        <AlertsQueue status={status} notify={notify} refresh={refresh} />
+      </div>
+      <div className={tab === "mcp" ? "" : "hidden"}>
+        <McpDocs />
+      </div>
+      <div className={tab === "api" ? "" : "hidden"}>
+        <ApiDocs />
+      </div>
+    </>
+  );
+}
 
 export function App() {
   const notify = useToasts();
   // Bumping this remounts SendAlert so it re-fetches TTS providers with new auth.
   const [tokenVersion, setTokenVersion] = useState(() => loadToken());
   const { status, connection, refresh } = useStatus(notify);
+  const [tab, setTab] = useState<TabId>(loadTab);
 
-  const refreshProviders = useCallback(() => {
-    setTokenVersion(String(Date.now()));
-  }, []);
+  const pick = (next: TabId) => {
+    setTab(next);
+    saveTab(next);
+  };
 
   return (
     <div className="mx-auto flex max-w-2xl flex-col gap-3 px-4 pb-20 pt-6 sm:gap-4">
       <Header connection={connection} />
-      <Output status={status} notify={notify} />
-      <AirPlay status={status} notify={notify} refresh={refresh} />
-      <Background status={status} notify={notify} refresh={refresh} />
-      <SendAlert key={tokenVersion} notify={notify} refresh={refresh} />
-      <Namespaces status={status} notify={notify} refresh={refresh} />
-      <AlertsQueue status={status} notify={notify} refresh={refresh} />
-      <TokenBox notify={notify} onSaved={refreshProviders} />
+      <TabBar tab={tab} onTab={pick} />
+      <Panels tab={tab} notify={notify} refresh={refresh} status={status} tokenVersion={tokenVersion} />
+      <TokenBox notify={notify} onSaved={() => setTokenVersion(String(Date.now()))} />
     </div>
   );
 }
 
 function Header({ connection }: { connection: ConnectionState }) {
   const dot =
-    connection === "ok"
-      ? "bg-ok"
-      : connection === "error"
-        ? "bg-warn"
-        : "bg-line";
+    connection === "ok" ? "bg-ok" : connection === "error" ? "bg-warn" : "bg-line";
   const label =
     connection === "ok"
       ? "server reachable"
@@ -63,10 +100,7 @@ function Header({ connection }: { connection: ConnectionState }) {
         <h1 className="text-lg leading-tight font-semibold">unsonido</h1>
         <p className="text-xs text-muted">one room, one mix</p>
       </div>
-      <span
-        className={"ml-auto inline-flex items-center gap-2 text-xs text-muted"}
-        title={label}
-      >
+      <span className={"ml-auto inline-flex items-center gap-2 text-xs text-muted"} title={label}>
         <span className={"h-2 w-2 rounded-full " + dot} />
         {connection === "error" ? "unreachable" : "live"}
       </span>

@@ -41,12 +41,14 @@ export function Tag({
   title,
   children,
 }: {
-  kind?: "default" | "critical" | "ok";
+  kind?: "default" | "muted" | "accent" | "critical" | "ok";
   title?: string;
   children: ReactNode;
 }) {
   const cls = {
     default: "border-line text-muted",
+    muted: "border-line/70 text-muted/80",
+    accent: "border-accent/60 text-accent",
     critical: "border-warn/60 text-warn",
     ok: "border-ok/50 text-ok",
   }[kind];
@@ -164,12 +166,50 @@ export function nowPlayingText(np: {
   return [np.title, np.artist].filter(Boolean).join(" — ");
 }
 
+/** Preformatted code with a one-click copy button. */
+export function CodeBlock({ code }: { code: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className="relative">
+      <pre className="overflow-x-auto rounded-xl border border-line bg-paper p-3 pr-14 font-mono text-[11px] leading-relaxed whitespace-pre text-ink">
+        {code}
+      </pre>
+      <button
+        type="button"
+        onClick={copy}
+        className={
+          "absolute top-2 right-2 cursor-pointer rounded-lg border border-line bg-card px-2 py-1 text-[11px] transition-colors hover:text-ink " +
+          (copied ? "text-ok" : "text-muted")
+        }
+      >
+        {copied ? "Copied" : "Copy"}
+      </button>
+    </div>
+  );
+}
+
 /** Small inline icon set (stroke-based, currentColor). */
 export function Icon({
   name,
   className = "h-4 w-4",
 }: {
-  name: "speaker" | "radio" | "bell" | "layers" | "history" | "key";
+  name:
+    | "speaker"
+    | "radio"
+    | "bell"
+    | "layers"
+    | "history"
+    | "key"
+    | "book";
   className?: string;
 }) {
   const paths: Record<string, ReactNode> = {
@@ -209,6 +249,12 @@ export function Icon({
       <>
         <circle cx="8" cy="15" r="4" />
         <path d="m11 12 9-9M17 6l3 3M21 4l-2.5 2.5" />
+      </>
+    ),
+    book: (
+      <>
+        <path d="M4 5a2 2 0 0 1 2-2h14v18H6a2 2 0 0 1-2-2V5Z" />
+        <path d="M20 17H6a2 2 0 0 0-2 2" />
       </>
     ),
   };

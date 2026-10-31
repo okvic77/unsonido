@@ -92,3 +92,14 @@ export interface SyncReport {
   results: Record<string, Outcome>;
   pruned: string[];
 }
+
+/** A tool advertised by the MCP server (subset of the tools/list schema). */
+export interface McpTool {
+  name: string;
+  description: string;
+  inputSchema: {
+    type: string;
+    properties?: Record<string, unknown>;
+    required?: string[];
+  };
+}
