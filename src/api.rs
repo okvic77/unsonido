@@ -23,7 +23,8 @@
 //!   PUT    /airplay/{name}          {"volume": 0.0..1.0, "muted": bool} local trim per speaker
 //!   DELETE /airplay/{name}/session  disconnect the sender
 //!   GET    /tts/providers
-//!   GET    /                web control page
+//!   GET    /                web control page (built from ui/, embedded)
+//!   GET    /assets/{file}   the control page's JS and CSS
 
 use std::sync::Arc;
 
@@ -89,6 +90,7 @@ pub fn router(services: Services, token: Option<String>, max_body: usize) -> Rou
         .route("/airplay/{name}/session", delete(disconnect_receiver))
         .route("/tts/providers", get(tts_providers))
         .route("/", get(ui))
+        .route("/assets/{*path}", get(ui_asset))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .layer(DefaultBodyLimit::max(max_body))
         .with_state(state)
@@ -96,7 +98,9 @@ pub fn router(services: Services, token: Option<String>, max_body: usize) -> Rou
 
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
     // The page itself is public; it sends the token with its API calls.
-    if let Some(expected) = state.token.as_ref().filter(|_| request.uri().path() != "/") {
+    let path = request.uri().path();
+    let public = path == "/" || path.starts_with("/assets/");
+    if let Some(expected) = state.token.as_ref().filter(|_| !public) {
         let provided = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -289,8 +293,20 @@ async fn replace_namespace(
     }
 }
 
+// The control page is built with pnpm in `ui/` and embedded here, so the binary
+// stays self-contained: `cargo build` needs no Node toolchain. Rebuild the assets
+// with `pnpm --dir ui build` after changing the UI.
 async fn ui() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("ui.html"))
+    axum::response::Html(include_str!("../ui/dist/index.html"))
+}
+
+async fn ui_asset(Path(path): Path<String>) -> Response {
+    let (mime, bytes) = match path.as_str() {
+        "app.js" => ("text/javascript", include_bytes!("../ui/dist/assets/app.js").as_slice()),
+        "app.css" => ("text/css", include_bytes!("../ui/dist/assets/app.css").as_slice()),
+        _ => return error(StatusCode::NOT_FOUND, "no such asset"),
+    };
+    ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")], bytes).into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Response {

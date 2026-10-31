@@ -20,6 +20,20 @@ cargo run --release -- devices        # list output devices
 
 Open <http://localhost:7700/> for the control page: volume, AirPlay status, background stream, alerts.
 
+## Control page
+
+The page in `ui/` is a React app (Vite + Tailwind CSS). Its built output is committed in
+`ui/dist` and embedded into the binary, so `cargo build` has no Node toolchain requirements.
+
+```sh
+pnpm --dir ui build     # rebuild the embedded page; then build/run the server again
+pnpm --dir ui dev       # live-reloading dev server; proxies API calls to localhost:7700
+```
+
+For `pnpm dev` to be useful, run the server on the default port in another terminal. The page
+keeps the same API contract as before: status polling, bearer token in the `unsonido-token`
+localStorage key.
+
 The example config defines two AirPlay speakers, **Unsonido Sala** and **Unsonido Cocina**. Pick
 one in the AirPlay menu of an iPhone, iPad or Mac (Control Center → AirPlay, or the AirPlay
 button in Music). Two devices can stream at once, one per speaker, and both are mixed. Add more

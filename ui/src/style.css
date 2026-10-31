@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+/*
+ * Semantic colors as CSS variables, flipped by prefers-color-scheme, mapped into
+ * Tailwind theme tokens ("@theme inline"), so `bg-card`, `text-ink`, … follow dark
+ * mode automatically.
+ */
+:root {
+  --c-paper: #f4f4f1;
+  --c-card: #ffffff;
+  --c-ink: #1c1c1a;
+  --c-muted: #6b6b66;
+  --c-line: #e3e3de;
+  --c-accent: #2f6fed;
+  --c-ok: #1f9d55;
+  --c-warn: #c2410c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-paper: #141413;
+    --c-card: #1d1d1b;
+    --c-ink: #ececea;
+    --c-muted: #9a9a94;
+    --c-line: #2e2e2b;
+    --c-accent: #6d9bff;
+    --c-ok: #4ade80;
+    --c-warn: #fb923c;
+  }
+}
+
+@theme inline {
+  --color-paper: var(--c-paper);
+  --color-card: var(--c-card);
+  --color-ink: var(--c-ink);
+  --color-muted: var(--c-muted);
+  --color-line: var(--c-line);
+  --color-accent: var(--c-accent);
+  --color-ok: var(--c-ok);
+  --color-warn: var(--c-warn);
+}
+
+/* Range inputs: Tailwind can't style the thumb; keep them simple and colored. */
+input[type="range"] {
+  accent-color: var(--c-accent);
+}
