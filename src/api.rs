@@ -293,20 +293,37 @@ async fn replace_namespace(
     }
 }
 
-// The control page is built with pnpm in `ui/` and embedded here, so the binary
-// stays self-contained: `cargo build` needs no Node toolchain. Rebuild the assets
-// with `pnpm --dir ui build` after changing the UI.
+// The control page is built with pnpm in `ui/`; build.rs builds it when the UI
+// sources change and puts the files in OUT_DIR, from where they are embedded
+// here — the binary stays self-contained, with no Node toolchain needed at
+// runtime or for a plain `cargo build` when the page is already built.
 async fn ui() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../ui/dist/index.html"))
+    axum::response::Html(include_str!(concat!(
+        env!("OUT_DIR"),
+        "/unsonido-ui/index.html"
+    )))
 }
 
 async fn ui_asset(Path(path): Path<String>) -> Response {
     let (mime, bytes) = match path.as_str() {
-        "app.js" => ("text/javascript", include_bytes!("../ui/dist/assets/app.js").as_slice()),
-        "app.css" => ("text/css", include_bytes!("../ui/dist/assets/app.css").as_slice()),
+        "app.js" => (
+            "text/javascript",
+            include_bytes!(concat!(env!("OUT_DIR"), "/unsonido-ui/assets/app.js")).as_slice(),
+        ),
+        "app.css" => (
+            "text/css",
+            include_bytes!(concat!(env!("OUT_DIR"), "/unsonido-ui/assets/app.css")).as_slice(),
+        ),
         _ => return error(StatusCode::NOT_FOUND, "no such asset"),
     };
-    ([(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")], bytes).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 async fn status(State(state): State<AppState>) -> Response {

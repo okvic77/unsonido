@@ -2,3 +2,4 @@
 /unsonido.toml
 *.wav
 /ui/node_modules
+/ui/dist

@@ -25,17 +25,36 @@ Open <http://localhost:7700/> for the control page: volume, AirPlay status, back
 The page in `ui/` is a React app (Vite + Tailwind CSS), organized in tabs: **Output** (volume +
 AirPlay speakers), **Background** (radio/stream), **Alerts** (send, namespaces, queue) and two
 reference tabs, **MCP Docs** (rendered live from `tools/list`) and **API Docs** (with copyable
-curl examples). Its built output is committed in `ui/dist` and embedded into the binary, so
-`cargo build` has no Node toolchain requirements.
+curl examples).
+
+A `build.rs` step builds the page with pnpm whenever the UI sources change and embeds it into
+the binary, so `cargo build` stays the only step: a fresh checkout with Node and pnpm
+(`corepack enable pnpm`) needs nothing else. Without pnpm the server still builds and serves a
+placeholder page with a warning in the build log. To work on the UI itself:
 
 ```sh
-pnpm --dir ui build     # rebuild the embedded page; then build/run the server again
+pnpm --dir ui build     # explicit build; picked up by the next cargo build
 pnpm --dir ui dev       # live-reloading dev server; proxies API calls to localhost:7700
 ```
 
-For `pnpm dev` to be useful, run the server on the default port in another terminal. The page
-keeps the same API contract as before: status polling, bearer token in the `unsonido-token`
+The page keeps the same API contract: status polling, bearer token in the `unsonido-token`
 localStorage key.
+
+## CI and releases
+
+- **CI** (`.github/workflows/ci.yml`): every push to `main` and every PR runs `cargo test`
+  (which also type-checks and builds the UI page through `build.rs`).
+- **Releases** (`.github/workflows/release.yml`): pushing a `v*` tag builds and publishes
+  binaries — a macOS universal build (arm64 + x86_64 lipo'd) and a Linux x86_64 build, each as
+  a tarball with `README.md` and `unsonido.example.toml`, plus a sha256 file.
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0   # creates the GitHub release with artifacts
+```
+
+The tag version should match `version` in `Cargo.toml`. Tag names with pre-release suffixes
+(`v0.2.0-rc1`) release as a pre-release via GitHub's default handling.
 
 The example config defines two AirPlay speakers, **Unsonido Sala** and **Unsonido Cocina**. Pick
 one in the AirPlay menu of an iPhone, iPad or Mac (Control Center → AirPlay, or the AirPlay

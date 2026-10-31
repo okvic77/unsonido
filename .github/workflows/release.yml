@@ -1,0 +1,101 @@
+name: Release
+
+# Tag a release with `git tag v0.1.0 && git push origin v0.1.0`, or run by hand.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # cpal works on Windows/other targets, but this matrix covers the
+          # platforms the project is developed and configured for.
+          - os: macos-latest # arm64 runner; the universal binary is lipo'd below
+          - os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - if: runner.os == 'Linux'
+        name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libavahi-compat-libdnssd-dev
+
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          # A second Apple target so both slices are lipo'd into one universal binary.
+          if [ "$RUNNER_OS" = "macOS" ]; then rustup target add x86_64-apple-darwin; fi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create target/release/unsonido target/x86_64-apple-darwin/release/unsonido -output unsonido
+
+      - name: Build (Linux x86_64)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          cp target/release/unsonido unsonido
+
+      - name: Package
+        env:
+          NAME: unsonido-${{ github.ref_name }}
+          OSNAME: ${{ runner.os == 'macOS' && 'macos-universal' || 'linux-x86_64' }}
+        run: |
+          rm -rf stage && mkdir stage
+          cp unsonido stage/
+          cp README.md unsonido.example.toml stage/
+          mv stage "${NAME}-${OSNAME}"
+          tar -czf "${NAME}-${OSNAME}.tar.gz" "${NAME}-${OSNAME}"
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${NAME}-${OSNAME}.tar.gz" > "${NAME}-${OSNAME}.tar.gz.sha256"
+          else
+            shasum -a 256 "${NAME}-${OSNAME}.tar.gz" > "${NAME}-${OSNAME}.tar.gz.sha256"
+          fi
+
+      - name: Attach artifact (non-tag builds)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os == 'macOS' && 'macos-universal' || 'linux-x86_64' }}
+          path: unsonido-*.tar.gz*
+
+      # Only a pushed v* tag creates the release; manual runs just attach artifacts.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: unsonido-*.tar.gz*
+          generate_release_notes: true
