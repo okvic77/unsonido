@@ -104,6 +104,7 @@ async fn run(cfg: Config) -> Result<()> {
         critical_tx,
     )?;
     alerts.spawn_event_pump(ev_rx);
+    alerts.spawn_scheduler();
 
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen)
         .await

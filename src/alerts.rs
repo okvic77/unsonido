@@ -4,6 +4,9 @@
 //! Alerts can be posted anonymously, or applied kubectl-style into a namespace under a name
 //! (`calendar`, `agents`, `script`, ...). A named alert replaces a pending one with the same
 //! name, can be deleted before it plays, and auto-destructs out of its namespace once played.
+//! Applying with `at` schedules it for a future moment instead; the dispatcher hands each
+//! alert to the mixer as it falls due, and a namespace can be synced wholesale: apply a set
+//! of alerts, prune the rest.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow};
-use chrono::{Local, NaiveTime};
+use chrono::{DateTime, Local, MappedLocalTime, NaiveDate, NaiveDateTime, NaiveTime};
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::audio;
 use crate::config::{AlertsConfig, QuietHours};
@@ -21,8 +25,13 @@ use crate::engine::{AlertPriority, Command, Event, FinishReason, Levels, Prepare
 use crate::tts::{SpeechRequest, Tts};
 
 const HISTORY_LEN: usize = 20;
+/// How often the scheduler looks for alerts that fell due.
+const TICK: Duration = Duration::from_secs(1);
+/// A due alert whose rendering keeps failing is retried this often, then dropped.
+const DISPATCH_ATTEMPTS: u8 = 3;
+const RETRY_AFTER: chrono::Duration = chrono::Duration::seconds(30);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlertRequest {
     /// Stable id for deduplication, e.g. "calendar:<event-id>:5min".
@@ -40,12 +49,16 @@ pub struct AlertRequest {
     pub repeat: Option<u32>,
     /// Play a chime first. Defaults to true.
     pub chime: Option<bool>,
+    /// Play at this future time instead of right away. Needs a namespace and name.
+    /// RFC 3339 or "YYYY-MM-DD HH:MM" in local time; a past time plays immediately.
+    pub at: Option<String>,
 }
 
 fn default_priority() -> AlertPriority {
     AlertPriority::Notification
 }
 
+#[derive(Clone, PartialEq)]
 pub enum Content {
     Text {
         text: String,
@@ -60,6 +73,15 @@ pub enum Content {
     ChimeOnly,
 }
 
+/// What to play, in a form that can wait in a namespace, be compared for idempotence,
+/// and be rendered whenever the moment comes.
+#[derive(Clone, PartialEq)]
+pub struct AlertSpec {
+    pub content: Content,
+    pub repeat: u32,
+    pub chime: bool,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum Outcome {
@@ -68,6 +90,14 @@ pub enum Outcome {
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         duration_ms: u64,
+    },
+    Scheduled {
+        id: String,
+        due_at: String,
+    },
+    /// An identical alert is already stored under this name.
+    Unchanged {
+        id: String,
     },
     Suppressed {
         id: String,
@@ -85,6 +115,16 @@ pub enum AlertError {
 impl From<anyhow::Error> for AlertError {
     fn from(err: anyhow::Error) -> Self {
         Self::Failed(err)
+    }
+}
+
+impl AlertError {
+    pub fn message(&self) -> String {
+        match self {
+            AlertError::Invalid(message) => message.clone(),
+            AlertError::QueueFull => "alert queue is full".into(),
+            AlertError::Failed(err) => format!("{err:#}"),
+        }
     }
 }
 
@@ -108,20 +148,28 @@ pub struct HistoryEntry {
     pub at: String,
 }
 
-/// A named alert waiting to play, by namespace then name; auto-destructs once played.
+/// One alert applied into a namespace, as the API and UI see it.
 #[derive(Clone, Serialize)]
 pub struct StoredAlert {
-    #[serde(flatten)]
-    pub info: AlertInfo,
-    /// "playing" or "pending".
+    pub namespace: String,
+    pub name: String,
+    pub priority: AlertPriority,
+    pub label: String,
+    /// Engine id, once the alert has been handed off to play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub state: StoredState,
+    /// Present while the alert waits for its moment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_at: Option<String>,
 }
 
-#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Serialize, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum StoredState {
     Playing,
     Pending,
+    Scheduled,
 }
 
 #[derive(Serialize)]
@@ -144,6 +192,27 @@ pub struct Status {
     pub namespaces: Vec<NamespaceInfo>,
 }
 
+/// Result of syncing a whole namespace: per-alert outcomes, plus what was pruned.
+#[derive(Serialize)]
+pub struct SyncReport {
+    pub namespace: String,
+    pub results: BTreeMap<String, serde_json::Value>,
+    pub pruned: Vec<String>,
+}
+
+/// One alert applied into a namespace. While scheduled it waits with `due_at` set and no
+/// engine id; the moment it is handed off, an engine id is reserved so a newer apply or
+/// a delete can still cancel it while it renders.
+#[derive(Clone)]
+struct StoredEntry {
+    id: Option<String>,
+    priority: AlertPriority,
+    label: String,
+    spec: AlertSpec,
+    due_at: Option<DateTime<Local>>,
+    attempts: u8,
+}
+
 #[derive(Default)]
 struct State {
     current: Option<AlertInfo>,
@@ -151,19 +220,10 @@ struct State {
     history: VecDeque<HistoryEntry>,
     /// Explicit ids seen recently, for deduplication.
     recent: HashMap<String, Instant>,
-    /// Named alerts waiting to play, by namespace then name. Entries auto-destruct
-    /// when the alert finishes.
-    namespaces: BTreeMap<String, BTreeMap<String, AlertInfo>>,
+    /// Alerts applied into namespaces, by namespace then name. Entries auto-destruct
+    /// when the alert finishes playing.
+    namespaces: BTreeMap<String, BTreeMap<String, StoredEntry>>,
     volume: f32,
-}
-
-/// How a submission is tracked: anonymous, or kubectl-style inside a namespace.
-enum Identity {
-    /// Deduplicated on an explicit id when given; anonymous otherwise.
-    Plain { id: Option<String> },
-    /// Registered under (namespace, name). Applying replaces a pending alert with
-    /// that name; the entry auto-destructs once the alert has played.
-    Named { namespace: String, name: String },
 }
 
 pub struct AlertService {
@@ -236,6 +296,18 @@ impl AlertService {
             .expect("spawning event thread");
     }
 
+    /// Wake every second and hand alerts that fell due to the mixer.
+    pub fn spawn_scheduler(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(TICK);
+            loop {
+                tick.tick().await;
+                this.dispatch_due().await;
+            }
+        });
+    }
+
     fn on_event(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
         match event {
@@ -274,7 +346,7 @@ impl AlertService {
                 // Auto-destruct: a played alert leaves its namespace, and an empty
                 // namespace disappears with it.
                 state.namespaces.retain(|_, alerts| {
-                    alerts.retain(|_, a| a.id != alert.id);
+                    alerts.retain(|_, a| a.id.as_deref() != Some(alert.id.as_str()));
                     !alerts.is_empty()
                 });
             }
@@ -290,10 +362,18 @@ impl AlertService {
             .send_if_modified(|active| std::mem::replace(active, critical) != critical);
     }
 
+    /// Post an anonymous alert, deduplicated on `id`. Anonymous alerts cannot be
+    /// scheduled; `at` belongs to the named, kubectl-style ones.
     pub async fn submit(&self, request: AlertRequest) -> Result<Outcome, AlertError> {
+        if request.at.is_some() {
+            return Err(AlertError::Invalid(
+                "`at` schedules an alert, which needs a namespace and name; use PUT /namespaces/{ns}/alerts/{name}"
+                    .into(),
+            ));
+        }
         let content = content_of(&request)?;
         self.enqueue_alert(
-            Identity::Plain { id: request.id },
+            request.id,
             request.priority,
             content,
             request.repeat,
@@ -302,8 +382,9 @@ impl AlertService {
         .await
     }
 
-    /// kubectl-style: apply an alert under (namespace, name). A pending alert with the
-    /// same name is replaced; the entry auto-destructs once the alert has played.
+    /// kubectl-style: apply an alert under (namespace, name). It plays immediately, or at
+    /// `at` when given. Applying again replaces the stored alert with the same name — an
+    /// identical apply is a no-op — and the entry auto-destructs once the alert has played.
     pub async fn apply(
         &self,
         namespace: String,
@@ -312,15 +393,17 @@ impl AlertService {
     ) -> Result<Outcome, AlertError> {
         validate_name(&namespace, "namespace")?;
         validate_name(&name, "name")?;
-        let content = content_of(&request)?;
-        self.enqueue_alert(
-            Identity::Named { namespace, name },
-            request.priority,
-            content,
-            request.repeat,
-            request.chime.unwrap_or(true),
-        )
-        .await
+        let spec = AlertSpec {
+            content: content_of(&request)?,
+            repeat: request.repeat.unwrap_or(1),
+            chime: request.chime.unwrap_or(true),
+        };
+        let at = match request.at {
+            Some(value) => Some(parse_at(&value)?),
+            None => None,
+        };
+        self.apply_spec(namespace, name, request.priority, spec, at)
+            .await
     }
 
     /// Like [`apply`](Self::apply), but with already-built content (uploaded audio).
@@ -329,20 +412,73 @@ impl AlertService {
         namespace: String,
         name: String,
         priority: AlertPriority,
-        content: Content,
-        repeat: Option<u32>,
-        chime: bool,
+        spec: AlertSpec,
+        at: Option<String>,
     ) -> Result<Outcome, AlertError> {
         validate_name(&namespace, "namespace")?;
         validate_name(&name, "name")?;
-        self.enqueue_alert(
-            Identity::Named { namespace, name },
-            priority,
-            content,
-            repeat,
-            chime,
-        )
-        .await
+        let at = match at {
+            Some(value) => Some(parse_at(&value)?),
+            None => None,
+        };
+        self.apply_spec(namespace, name, priority, spec, at).await
+    }
+
+    /// Replace a whole namespace at once: apply every alert in `alerts` by name, then prune
+    /// the stored entries that are not in the set — the kubectl "apply a folder, delete the
+    /// rest" sync.
+    pub async fn sync_namespace(
+        &self,
+        namespace: String,
+        alerts: BTreeMap<String, AlertRequest>,
+    ) -> Result<SyncReport, AlertError> {
+        validate_name(&namespace, "namespace")?;
+        let mut results = BTreeMap::new();
+        for (name, request) in &alerts {
+            let result = match validate_name(name, "name") {
+                Err(err) => Err(err),
+                Ok(()) => {
+                    self.apply(namespace.clone(), name.clone(), request.clone())
+                        .await
+                }
+            };
+            let value = match result {
+                Ok(outcome) => serde_json::to_value(outcome).unwrap_or_default(),
+                Err(err) => json!({ "error": err.message() }),
+            };
+            results.insert(name.clone(), value);
+        }
+        // Prune: entries not in the applied set are removed.
+        let (pruned, cancelled) = {
+            let mut state = self.state.lock().unwrap();
+            let mut pruned = Vec::new();
+            let mut cancelled = Vec::new();
+            if let Some(entries) = state.namespaces.get_mut(&namespace) {
+                for name in entries.keys().cloned().collect::<Vec<_>>() {
+                    if alerts.contains_key(&name) {
+                        continue;
+                    }
+                    if let Some(entry) = entries.remove(&name) {
+                        pruned.push(name);
+                        if let Some(id) = entry.id {
+                            cancelled.push(id);
+                        }
+                    }
+                }
+                if entries.is_empty() {
+                    state.namespaces.remove(&namespace);
+                }
+            }
+            (pruned, cancelled)
+        };
+        for id in cancelled {
+            let _ = self.commands.try_send(Command::CancelAlert(id));
+        }
+        Ok(SyncReport {
+            namespace,
+            results,
+            pruned,
+        })
     }
 
     pub async fn submit_content(
@@ -353,13 +489,322 @@ impl AlertService {
         repeat: Option<u32>,
         chime: bool,
     ) -> Result<Outcome, AlertError> {
-        self.enqueue_alert(Identity::Plain { id }, priority, content, repeat, chime)
+        self.enqueue_alert(id, priority, content, repeat, chime)
             .await
     }
 
+    /// The shared body of apply: validate, store the entry (replacing the old one), then
+    /// either schedule it or render and hand it to the mixer right now.
+    async fn apply_spec(
+        &self,
+        namespace: String,
+        name: String,
+        priority: AlertPriority,
+        spec: AlertSpec,
+        at: Option<DateTime<Local>>,
+    ) -> Result<Outcome, AlertError> {
+        if spec.repeat == 0 || spec.repeat > self.cfg.max_repeat {
+            return Err(AlertError::Invalid(format!(
+                "`repeat` must be between 1 and {}",
+                self.cfg.max_repeat
+            )));
+        }
+        if let Content::Text {
+            provider: Some(p), ..
+        } = &spec.content
+            && !self.tts.has_provider(p)
+        {
+            return Err(AlertError::Invalid(format!("unknown tts provider {p:?}")));
+        }
+        // A due time in the past plays now, like a calendar event that is already late.
+        let due_at = at.filter(|t| *t > Local::now());
+
+        // Quiet hours only gate the immediate path; a scheduled alert is judged when it fires.
+        if due_at.is_none() && priority == AlertPriority::Notification && self.quiet_hours_active()
+        {
+            return Ok(Outcome::Suppressed {
+                id: format!("{namespace}/{name}"),
+                reason: "quiet_hours",
+            });
+        }
+
+        let (old, id, label) = {
+            let mut state = self.state.lock().unwrap();
+            // An identical apply changes nothing (kubectl-style idempotence).
+            if let Some(entry) = state
+                .namespaces
+                .get(&namespace)
+                .and_then(|alerts| alerts.get(&name))
+                && entry.spec == spec
+                && entry.priority == priority
+                && entry.due_at == due_at
+            {
+                return Ok(Outcome::Unchanged {
+                    id: entry
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("{namespace}/{name}")),
+                });
+            }
+            if due_at.is_none() && state.queue.len() >= self.cfg.max_queue {
+                return Err(AlertError::QueueFull);
+            }
+            let old = state
+                .namespaces
+                .get_mut(&namespace)
+                .and_then(|alerts| alerts.remove(&name));
+            // "<ns>/<name>#<n>" reads well in logs and stays unique across replaces.
+            let id = due_at.is_none().then(|| {
+                format!(
+                    "{namespace}/{name}#{}",
+                    self.named_seq.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+            let label = label_of(&spec.content);
+            state
+                .namespaces
+                .entry(namespace.clone())
+                .or_default()
+                .insert(
+                    name.clone(),
+                    StoredEntry {
+                        id: id.clone(),
+                        priority,
+                        label: label.clone(),
+                        spec: spec.clone(),
+                        due_at,
+                        attempts: 0,
+                    },
+                );
+            (old, id, label)
+        };
+        // Replace: the stored alert with this name is cancelled. If the new render then
+        // fails, the old one is already gone — last apply wins.
+        if let Some(old) = old
+            && let Some(old_id) = old.id
+        {
+            let _ = self.commands.try_send(Command::CancelAlert(old_id));
+        }
+
+        if let Some(due) = due_at {
+            tracing::info!(namespace = %namespace, name = %name, due = %due, "alert scheduled");
+            return Ok(Outcome::Scheduled {
+                id: format!("{namespace}/{name}"),
+                due_at: due.to_rfc3339(),
+            });
+        }
+
+        let id = id.expect("an immediate apply reserved an engine id");
+        let rendered = self
+            .render(priority, spec.content.clone(), spec.repeat, spec.chime)
+            .await;
+        let (audio, provider) = match rendered {
+            Ok(r) => r,
+            Err(err) => {
+                self.remove_if_ours(&namespace, &name, &id);
+                return Err(err);
+            }
+        };
+        let duration_ms = (audio.len() / audio::CHANNELS) as u64 * 1000 / self.rate as u64;
+        match self.commit(&namespace, &name, &id, priority, &label, audio) {
+            Ok(()) => {
+                tracing::info!(id = %id, ?priority, duration_ms, "alert queued");
+                Ok(Outcome::Queued {
+                    id,
+                    provider,
+                    duration_ms,
+                })
+            }
+            // A newer apply owns the entry now; this one never made it out.
+            Err(CommitError::Replaced) => Ok(Outcome::Suppressed {
+                id,
+                reason: "replaced",
+            }),
+            Err(CommitError::QueueFull) => {
+                self.remove_if_ours(&namespace, &name, &id);
+                Err(AlertError::QueueFull)
+            }
+            Err(CommitError::EngineStopped) => {
+                self.remove_if_ours(&namespace, &name, &id);
+                Err(AlertError::Failed(anyhow!("audio engine stopped")))
+            }
+        }
+    }
+
+    /// Hand a rendered clip to the mixer, unless the entry was replaced while it rendered.
+    fn commit(
+        &self,
+        namespace: &str,
+        name: &str,
+        id: &str,
+        priority: AlertPriority,
+        label: &str,
+        audio: Vec<f32>,
+    ) -> Result<(), CommitError> {
+        {
+            let mut state = self.state.lock().unwrap();
+            let still_ours = state
+                .namespaces
+                .get(namespace)
+                .and_then(|alerts| alerts.get(name))
+                .is_some_and(|entry| entry.id.as_deref() == Some(id));
+            if !still_ours {
+                return Err(CommitError::Replaced);
+            }
+            if state.queue.len() >= self.cfg.max_queue {
+                return Err(CommitError::QueueFull);
+            }
+            let info = AlertInfo {
+                id: id.into(),
+                priority,
+                label: label.into(),
+                namespace: Some(namespace.into()),
+                name: Some(name.into()),
+            };
+            // Track it before the mixer can report it started.
+            state.queue.push(info);
+        }
+        let prepared = PreparedAlert {
+            id: id.into(),
+            priority,
+            audio: Arc::new(audio),
+        };
+        if let Err(err) = self.commands.try_send(Command::Enqueue(prepared)) {
+            let mut state = self.state.lock().unwrap();
+            state.queue.retain(|a| a.id != id);
+            return Err(match err {
+                TrySendError::Full(_) => CommitError::QueueFull,
+                TrySendError::Disconnected(_) => CommitError::EngineStopped,
+            });
+        }
+        Ok(())
+    }
+
+    /// Everything whose moment has come, oldest first. Each entry is marked as handed off
+    /// (engine id reserved) so later ticks, applies and deletes agree on who owns it.
+    async fn dispatch_due(&self) {
+        let now = Local::now();
+        let mut due = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            for (namespace, alerts) in &mut state.namespaces {
+                for (name, entry) in alerts {
+                    if let Some(due_at) = entry.due_at
+                        && due_at <= now
+                    {
+                        let id = format!(
+                            "{namespace}/{name}#{}",
+                            self.named_seq.fetch_add(1, Ordering::Relaxed)
+                        );
+                        entry.id = Some(id.clone());
+                        entry.due_at = None;
+                        due.push((namespace.clone(), name.clone(), id, due_at, entry.clone()));
+                    }
+                }
+            }
+        }
+        due.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.1.cmp(&b.1)));
+        for (namespace, name, id, due_at, entry) in due {
+            self.dispatch_one(&namespace, &name, &id, due_at, &entry)
+                .await;
+        }
+    }
+
+    /// Play one due alert: render it, then enqueue it through the same commit path as an
+    /// immediate apply. Failures retry a few times before the alert is dropped.
+    async fn dispatch_one(
+        &self,
+        namespace: &str,
+        name: &str,
+        id: &str,
+        due_at: DateTime<Local>,
+        entry: &StoredEntry,
+    ) {
+        if entry.priority == AlertPriority::Notification && self.quiet_hours_active() {
+            if self.remove_if_ours(namespace, name, id).is_some() {
+                tracing::info!(id = id, "scheduled alert suppressed by quiet hours");
+            }
+            return;
+        }
+        let rendered = self
+            .render(
+                entry.priority,
+                entry.spec.content.clone(),
+                entry.spec.repeat,
+                entry.spec.chime,
+            )
+            .await;
+        let audio = match rendered {
+            Ok((audio, _)) => audio,
+            Err(err) => {
+                tracing::warn!("scheduled alert {id} failed to render: {}", err.message());
+                self.retry_or_drop(namespace, name, id);
+                return;
+            }
+        };
+        match self.commit(namespace, name, id, entry.priority, &entry.label, audio) {
+            Ok(()) => tracing::info!(id = id, due = %due_at, "scheduled alert queued"),
+            // A newer apply owns the entry now; this one never made it out.
+            Err(CommitError::Replaced) => {}
+            Err(err) => {
+                tracing::warn!("scheduled alert {id} could not be queued: {err:?}");
+                self.retry_or_drop(namespace, name, id);
+            }
+        }
+    }
+
+    /// After a failed dispatch: try again shortly, or drop the alert with an error.
+    fn retry_or_drop(&self, namespace: &str, name: &str, id: &str) {
+        let (attempts, drop_it) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(entry) = state
+                .namespaces
+                .get_mut(namespace)
+                .and_then(|alerts| alerts.get_mut(name))
+            else {
+                return;
+            };
+            if entry.id.as_deref() != Some(id) {
+                return; // replaced while we worked on it
+            }
+            entry.attempts += 1;
+            if entry.attempts >= DISPATCH_ATTEMPTS {
+                (entry.attempts, true)
+            } else {
+                entry.due_at = Some(Local::now() + RETRY_AFTER);
+                entry.id = None; // back to waiting
+                (entry.attempts, false)
+            }
+        };
+        if drop_it {
+            let mut state = self.state.lock().unwrap();
+            remove_entry(&mut state, namespace, name);
+            tracing::error!("scheduled alert {id} dropped after {attempts} attempts");
+        } else {
+            tracing::warn!("scheduled alert {id} will be retried (attempt {attempts})");
+        }
+    }
+
+    /// Remove the entry again if it is still the one we reserved; a newer apply owns it
+    /// otherwise. Returns what was removed.
+    fn remove_if_ours(&self, namespace: &str, name: &str, id: &str) -> Option<StoredEntry> {
+        let mut state = self.state.lock().unwrap();
+        let ours = state
+            .namespaces
+            .get(namespace)
+            .and_then(|alerts| alerts.get(name))
+            .is_some_and(|entry| entry.id.as_deref() == Some(id));
+        if ours {
+            remove_entry(&mut state, namespace, name)
+        } else {
+            None
+        }
+    }
+
+    /// Post an anonymous alert: dedupe, render, enqueue.
     async fn enqueue_alert(
         &self,
-        identity: Identity,
+        id: Option<String>,
         priority: AlertPriority,
         content: Content,
         repeat: Option<u32>,
@@ -379,18 +824,8 @@ impl AlertService {
         {
             return Err(AlertError::Invalid(format!("unknown tts provider {p:?}")));
         }
-        let (id, explicit_id) = match &identity {
-            Identity::Plain { id } => (
-                id.clone()
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                id.is_some(),
-            ),
-            // "<ns>/<name>#<n>" reads well in logs and stays unique across replaces.
-            Identity::Named { namespace, name } => {
-                let n = self.named_seq.fetch_add(1, Ordering::Relaxed);
-                (format!("{namespace}/{name}#{n}"), false)
-            }
-        };
+        let explicit_id = id.is_some();
+        let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         if priority == AlertPriority::Notification && self.quiet_hours_active() {
             return Ok(Outcome::Suppressed {
@@ -398,30 +833,6 @@ impl AlertService {
                 reason: "quiet_hours",
             });
         }
-
-        // Replace: a pending alert with the same name is cancelled first. If the new
-        // render then fails, the old one is already gone — last apply wins.
-        if let Identity::Named { namespace, name } = &identity {
-            let old = {
-                let mut state = self.state.lock().unwrap();
-                let old = state
-                    .namespaces
-                    .get_mut(namespace)
-                    .and_then(|alerts| alerts.remove(name));
-                if state
-                    .namespaces
-                    .get(namespace)
-                    .is_some_and(|alerts| alerts.is_empty())
-                {
-                    state.namespaces.remove(namespace);
-                }
-                old
-            };
-            if let Some(old) = old {
-                let _ = self.commands.try_send(Command::CancelAlert(old.id));
-            }
-        }
-
         {
             let mut state = self.state.lock().unwrap();
             if state.queue.len() >= self.cfg.max_queue {
@@ -441,12 +852,7 @@ impl AlertService {
             }
         }
 
-        let label = match &content {
-            Content::Text { text, .. } => text.chars().take(120).collect(),
-            Content::Url(url) => url.clone(),
-            Content::Audio { .. } => "uploaded audio".into(),
-            Content::ChimeOnly => "chime".into(),
-        };
+        let label = label_of(&content);
         let rendered = self.render(priority, content, repeat, chime).await;
         let (audio, provider) = match rendered {
             Ok(r) => r,
@@ -459,29 +865,15 @@ impl AlertService {
         };
 
         let duration_ms = (audio.len() / audio::CHANNELS) as u64 * 1000 / self.rate as u64;
-        let (namespace, name) = match &identity {
-            Identity::Named { namespace, name } => (Some(namespace.clone()), Some(name.clone())),
-            Identity::Plain { .. } => (None, None),
-        };
         let info = AlertInfo {
             id: id.clone(),
             priority,
             label,
-            namespace,
-            name,
+            namespace: None,
+            name: None,
         };
         // Track it before the mixer can report it started.
-        {
-            let mut state = self.state.lock().unwrap();
-            state.queue.push(info.clone());
-            if let Identity::Named { namespace, name } = &identity {
-                state
-                    .namespaces
-                    .entry(namespace.clone())
-                    .or_default()
-                    .insert(name.clone(), info.clone());
-            }
-        }
+        self.state.lock().unwrap().queue.push(info);
         let prepared = PreparedAlert {
             id: id.clone(),
             priority,
@@ -490,14 +882,6 @@ impl AlertService {
         if let Err(err) = self.commands.try_send(Command::Enqueue(prepared)) {
             let mut state = self.state.lock().unwrap();
             state.queue.retain(|a| a.id != id);
-            if let Identity::Named { namespace, name } = &identity
-                && let Some(alerts) = state.namespaces.get_mut(namespace)
-            {
-                alerts.remove(name);
-                if alerts.is_empty() {
-                    state.namespaces.remove(namespace);
-                }
-            }
             return Err(match err {
                 TrySendError::Full(_) => AlertError::QueueFull,
                 TrySendError::Disconnected(_) => {
@@ -644,19 +1028,20 @@ impl AlertService {
         }
     }
 
-    /// Every namespace and its pending alerts, e.g. `calendar`, `agents`, `script`.
+    /// Every namespace and its alerts, e.g. `calendar`, `agents`, `script`.
     pub fn list_namespaces(&self) -> Vec<NamespaceInfo> {
         let state = self.state.lock().unwrap();
         namespaces_view(&state)
     }
 
-    /// The alerts of one namespace, playing ones first. None when it does not exist.
+    /// The alerts of one namespace: playing, then pending, then the schedule in time order.
+    /// None when it does not exist.
     pub fn namespace_alerts(&self, namespace: &str) -> Option<Vec<StoredAlert>> {
         let state = self.state.lock().unwrap();
         state
             .namespaces
             .get(namespace)
-            .map(|alerts| stored_alerts(&state, alerts))
+            .map(|alerts| stored_alerts(&state, namespace, alerts))
     }
 
     /// One stored alert. None when it does not exist.
@@ -666,48 +1051,19 @@ impl AlertService {
             .namespaces
             .get(namespace)
             .and_then(|alerts| alerts.get(name))
-            .map(|info| stored_alert(&state, info))
+            .map(|entry| stored_alert(&state, namespace, name, entry))
     }
 
-    /// Delete a stored alert: it stops playing or leaves the queue. False when it
-    /// does not exist.
+    /// Delete a stored alert: a playing one stops, a queued one leaves the queue, a
+    /// scheduled one simply never happens. False when it does not exist.
     pub fn delete_alert(&self, namespace: &str, name: &str) -> bool {
-        let id = {
+        let removed = {
             let mut state = self.state.lock().unwrap();
-            let removed = state
-                .namespaces
-                .get_mut(namespace)
-                .and_then(|alerts| alerts.remove(name));
-            if removed.is_some()
-                && state
-                    .namespaces
-                    .get(namespace)
-                    .is_some_and(|alerts| alerts.is_empty())
-            {
-                state.namespaces.remove(namespace);
-            }
-            removed
+            remove_entry(&mut state, namespace, name)
         };
-        if let Some(info) = id {
-            let _ = self.commands.try_send(Command::CancelAlert(info.id));
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Delete a namespace and every alert in it. False when it does not exist.
-    pub fn delete_namespace(&self, namespace: &str) -> bool {
-        let ids = {
-            let mut state = self.state.lock().unwrap();
-            state
-                .namespaces
-                .remove(namespace)
-                .map(|alerts| alerts.into_values().map(|a| a.id).collect::<Vec<_>>())
-        };
-        match ids {
-            Some(ids) => {
-                for id in ids {
+        match removed {
+            Some(entry) => {
+                if let Some(id) = entry.id {
                     let _ = self.commands.try_send(Command::CancelAlert(id));
                 }
                 true
@@ -716,10 +1072,36 @@ impl AlertService {
         }
     }
 
+    /// Delete a namespace and every alert in it. False when it does not exist.
+    pub fn delete_namespace(&self, namespace: &str) -> bool {
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            state.namespaces.remove(namespace)
+        };
+        let Some(entries) = removed else {
+            return false;
+        };
+        for entry in entries.into_values() {
+            if let Some(id) = entry.id {
+                let _ = self.commands.try_send(Command::CancelAlert(id));
+            }
+        }
+        true
+    }
+
     fn quiet_hours_active(&self) -> bool {
         self.quiet_hours
             .is_some_and(|(start, end)| in_window(Local::now().time(), start, end))
     }
+}
+
+/// Handing a rendered clip to the mixer can go wrong in three ways.
+#[derive(Debug)]
+enum CommitError {
+    /// A newer apply owns the entry now.
+    Replaced,
+    QueueFull,
+    EngineStopped,
 }
 
 /// Build the content of a request: text to speak, an audio url, or a chime only.
@@ -762,6 +1144,68 @@ fn validate_name(value: &str, what: &str) -> Result<(), AlertError> {
     Ok(())
 }
 
+/// Parse an `at` time: RFC 3339 with any offset, or a local "YYYY-MM-DD HH:MM[:SS]"
+/// (with 'T' or a space, minutes optional), or a plain local date (midnight).
+fn parse_at(value: &str) -> Result<DateTime<Local>, AlertError> {
+    let value = value.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.with_timezone(&Local));
+    }
+    let naive = if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        date.and_hms_opt(0, 0, 0)
+            .ok_or_else(|| AlertError::Invalid("`at` is not a valid date".into()))?
+    } else {
+        [
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M",
+        ]
+        .iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(value, fmt).ok())
+        .ok_or_else(|| {
+            AlertError::Invalid(
+                "`at` must be RFC 3339 or \"YYYY-MM-DD HH:MM\" in local time".into(),
+            )
+        })?
+    };
+    match naive.and_local_timezone(Local) {
+        MappedLocalTime::Single(at) => Ok(at),
+        // Ambiguous in a DST fall-back gap: take the earlier reading.
+        MappedLocalTime::Ambiguous(at, _) => Ok(at),
+        MappedLocalTime::None => Err(AlertError::Invalid(
+            "`at` falls inside a DST gap; pick a time that exists".into(),
+        )),
+    }
+}
+
+/// The short human-readable form of an alert's content.
+fn label_of(content: &Content) -> String {
+    match content {
+        Content::Text { text, .. } => text.chars().take(120).collect(),
+        Content::Url(url) => url.clone(),
+        Content::Audio { .. } => "uploaded audio".into(),
+        Content::ChimeOnly => "chime".into(),
+    }
+}
+
+/// Remove an entry and its namespace when it empties. No engine commands.
+fn remove_entry(state: &mut State, namespace: &str, name: &str) -> Option<StoredEntry> {
+    let removed = state
+        .namespaces
+        .get_mut(namespace)
+        .and_then(|alerts| alerts.remove(name));
+    if removed.is_some()
+        && state
+            .namespaces
+            .get(namespace)
+            .is_some_and(|alerts| alerts.is_empty())
+    {
+        state.namespaces.remove(namespace);
+    }
+    removed
+}
+
 /// Snapshot of the namespaces for the status and the listing endpoints.
 fn namespaces_view(state: &State) -> Vec<NamespaceInfo> {
     state
@@ -769,27 +1213,47 @@ fn namespaces_view(state: &State) -> Vec<NamespaceInfo> {
         .iter()
         .map(|(name, alerts)| NamespaceInfo {
             name: name.clone(),
-            alerts: stored_alerts(state, alerts),
+            alerts: stored_alerts(state, name, alerts),
         })
         .collect()
 }
 
-fn stored_alerts(state: &State, alerts: &BTreeMap<String, AlertInfo>) -> Vec<StoredAlert> {
-    alerts
-        .values()
-        .map(|info| stored_alert(state, info))
+fn stored_alerts(
+    state: &State,
+    namespace: &str,
+    alerts: &BTreeMap<String, StoredEntry>,
+) -> Vec<StoredAlert> {
+    let mut entries: Vec<(&String, &StoredEntry)> = alerts.iter().collect();
+    entries.sort_by(|(an, ae), (bn, be)| {
+        entry_state(state, ae)
+            .cmp(&entry_state(state, be))
+            .then_with(|| ae.due_at.cmp(&be.due_at))
+            .then_with(|| an.cmp(bn))
+    });
+    entries
+        .into_iter()
+        .map(|(name, entry)| stored_alert(state, namespace, name, entry))
         .collect()
 }
 
-fn stored_alert(state: &State, info: &AlertInfo) -> StoredAlert {
-    let state_ = if state.current.as_ref().is_some_and(|c| c.id == info.id) {
-        StoredState::Playing
-    } else {
-        StoredState::Pending
-    };
+fn stored_alert(state: &State, namespace: &str, name: &str, entry: &StoredEntry) -> StoredAlert {
     StoredAlert {
-        info: info.clone(),
-        state: state_,
+        namespace: namespace.into(),
+        name: name.into(),
+        priority: entry.priority,
+        label: entry.label.clone(),
+        id: entry.id.clone(),
+        state: entry_state(state, entry),
+        due_at: entry.due_at.as_ref().map(|t| t.to_rfc3339()),
+    }
+}
+
+/// An entry with an engine id is playing or pending; one without is still scheduled.
+fn entry_state(state: &State, entry: &StoredEntry) -> StoredState {
+    match entry.id.as_deref() {
+        Some(id) if state.current.as_ref().is_some_and(|c| c.id == id) => StoredState::Playing,
+        Some(_) => StoredState::Pending,
+        None => StoredState::Scheduled,
     }
 }
 
@@ -859,5 +1323,83 @@ mod tests {
         assert!(content_of(&request(r#"{"text":"hi","url":"https://x.example/a.mp3"}"#)).is_err());
         assert!(content_of(&request(r#"{"chime":false}"#)).is_err());
         assert!(content_of(&request(r#"{"text":"  "}"#)).is_err());
+    }
+
+    #[test]
+    fn at_accepts_rfc3339_naive_and_date_only() {
+        let full = parse_at("2026-11-01T14:30:00").unwrap();
+        assert_eq!(full, parse_at("2026-11-01 14:30:00").unwrap());
+        assert_eq!(full, parse_at("2026-11-01T14:30").unwrap());
+        assert_eq!(full, parse_at("2026-11-01 14:30").unwrap());
+        assert_eq!(
+            parse_at("2026-11-01").unwrap(),
+            parse_at("2026-11-01T00:00:00").unwrap()
+        );
+        // Any offset converts to local time.
+        let utc = parse_at("2026-11-01T12:30:00Z").unwrap();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:30:00Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(utc.timestamp(), expected);
+        assert!(parse_at("not a time").is_err());
+        assert!(parse_at("2026-13-01").is_err());
+        assert!(parse_at("").is_err());
+    }
+
+    #[test]
+    fn stored_alerts_list_playing_pending_then_schedule() {
+        let current = AlertInfo {
+            id: "cal/now#0".into(),
+            priority: AlertPriority::Notification,
+            label: "now".into(),
+            namespace: Some("cal".into()),
+            name: Some("now".into()),
+        };
+        let mut state = State {
+            current: Some(current),
+            ..State::default()
+        };
+        let spec = AlertSpec {
+            content: Content::ChimeOnly,
+            repeat: 1,
+            chime: true,
+        };
+        let entry = |id: Option<&str>, due_at: Option<DateTime<Local>>| StoredEntry {
+            id: id.map(Into::into),
+            priority: AlertPriority::Notification,
+            label: "l".into(),
+            spec: spec.clone(),
+            due_at,
+            attempts: 0,
+        };
+        let mut alerts = BTreeMap::new();
+        alerts.insert(
+            "late".into(),
+            entry(None, Some(Local::now() + chrono::Duration::days(1))),
+        );
+        alerts.insert("queued".into(), entry(Some("cal/queued#1"), None));
+        alerts.insert(
+            "early".into(),
+            entry(None, Some(Local::now() + chrono::Duration::hours(1))),
+        );
+        alerts.insert("now".into(), entry(Some("cal/now#0"), None));
+        state.namespaces.insert("cal".into(), alerts);
+
+        let view = stored_alerts(&state, "cal", &state.namespaces["cal"]);
+        let order: Vec<(&str, StoredState)> =
+            view.iter().map(|a| (a.name.as_str(), a.state)).collect();
+        assert_eq!(
+            order,
+            [
+                ("now", StoredState::Playing),
+                ("queued", StoredState::Pending),
+                ("early", StoredState::Scheduled),
+                ("late", StoredState::Scheduled),
+            ]
+        );
+        // A scheduled entry has no engine id and shows its due time.
+        let early = view.iter().find(|a| a.name == "early").unwrap();
+        assert!(early.id.is_none());
+        assert!(early.due_at.is_some());
     }
 }

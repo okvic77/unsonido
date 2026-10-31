@@ -110,15 +110,16 @@ when policy drops the alert, `400` for invalid input, `429` when the queue is fu
 
 Alerts can be applied into a namespace under a name — `calendar`, `agents`, `script`, … — like kubectl
 resources. Applying queues the alert for playback and stores it; applying the same name again replaces
-the pending alert; deleting cancels it (or stops it if it is playing); and once an alert has played it
-self-destructs out of its namespace. A namespace exists while it holds pending alerts.
+the stored alert (an identical apply is a no-op); deleting cancels it (or stops it if it is playing);
+and once an alert has played it self-destructs out of its namespace. A namespace exists while it holds
+alerts.
 
 ```sh
 # Apply: play it, and keep it as calendar/standup until it does.
 curl -X PUT localhost:7700/namespaces/calendar/alerts/standup \
   -H 'content-type: application/json' -d '{"text":"Standup in two minutes"}'
 
-# POST works too; re-applying the same name replaces the pending alert.
+# POST works too; re-applying the same name replaces the stored alert.
 curl -X POST localhost:7700/namespaces/agents/alerts/task-done \
   -H 'content-type: application/json' -d '{"text":"Task done","priority":"critical"}'
 
@@ -132,14 +133,51 @@ curl -X DELETE localhost:7700/namespaces/calendar/alerts/standup
 curl -X DELETE localhost:7700/namespaces/calendar   # the namespace and everything in it
 ```
 
-Named alerts take the same body as `POST /alerts` (`text`, `url`, `priority`, `provider`, `voice`,
-`repeat`, `chime`) and the same policies (quiet hours, queue limits). They skip `id`-deduplication —
-re-applying a name is an explicit replace. The engine id is `<namespace>/<name>#<n>`, so a replaced
-alert can be cancelled while its replacement is already queued. Uploaded audio can be named too:
-add `?namespace=calendar&name=doorbell` to `POST /alerts/audio`.
+### Scheduled alerts (`at`)
 
-The control page applies alerts the same way: fill the namespace and name fields under "Send alert"
-and manage what waits under "Namespaces".
+Apply with `at` to schedule the alert for a future moment instead of playing it now — upload all of
+today's calendar events at once, and each one announces itself when its time comes, then disappears:
+
+```sh
+curl -X PUT localhost:7700/namespaces/calendar/alerts/dentist -H 'content-type: application/json' \
+  -d '{"text":"Dentist at four","at":"2026-11-02 15:45"}'
+```
+
+`at` accepts RFC 3339 (`2026-11-02T15:45:00-06:00`, `…Z`) or local time (`2026-11-02 15:45`,
+`2026-11-02T15:45:00`, or a plain date for midnight); a time in the past plays immediately, like an
+event that is already late. Scheduled entries wait as `"state": "scheduled"` with their `due_at`, and
+the dispatcher checks every second. Quiet hours are applied when the alert fires, not when it is
+applied; a notification that falls inside them is dropped with a log line. If rendering fails at the
+due moment (TTS down, unreachable url) the alert retries every 30 s up to three times, then
+self-destructs with an error in the log.
+
+### Syncing a whole namespace
+
+`PUT /namespaces/{ns}` replaces the namespace wholesale, the way `kubectl apply -f dir/` prunes:
+every alert in the set is applied (created or replaced; identical ones left untouched), and stored
+alerts that are not in the set are deleted. An empty set empties the namespace.
+
+```sh
+curl -X PUT localhost:7700/namespaces/calendar -H 'content-type: application/json' -d '{
+  "alerts": {
+    "standup": {"text": "Standup at nine",      "at": "2026-11-02 08:55"},
+    "lunch":   {"text": "Lunch with Ana",      "at": "2026-11-02 13:00"},
+    "dentist": {"text": "Dentist moved to 5",  "at": "2026-11-02 16:45", "priority": "critical"}
+  }
+}'
+# -> {"namespace":"calendar","results":{"dentist":{"status":"scheduled",...},
+#      "lunch":{"status":"scheduled",...},"standup":{"status":"scheduled",...}},"pruned":["old-event"]}
+```
+
+Named alerts take the same body as `POST /alerts` (`text`, `url`, `priority`, `provider`, `voice`,
+`repeat`, `chime`, and now `at`, which is only valid on a named alert) and the same policies. They
+skip `id`-deduplication — re-applying a name is an explicit replace. The engine id is
+`<namespace>/<name>#<n>`, so a replaced alert can be cancelled while its replacement is already
+queued. Uploaded audio can be named and scheduled too: add
+`?namespace=calendar&name=doorbell&at=2026-11-02+18:00` to `POST /alerts/audio`.
+
+The control page applies alerts the same way: fill the namespace and name fields under "Send alert",
+optionally pick a time, and manage what waits under "Namespaces" — playing, pending and scheduled.
 
 ## Text-to-speech
 

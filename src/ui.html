@@ -91,9 +91,10 @@
     <div class="row" style="margin-top:8px">
       <input id="alert-namespace" type="text" placeholder="namespace (default)" style="flex:0 1 150px">
       <input id="alert-name" type="text" placeholder="name — store it in the namespace (kubectl-style)" class="grow">
+      <input id="alert-at" type="datetime-local" title="Play at this time instead of now" style="flex:0 1 175px">
     </div>
     <p class="muted" style="margin:8px 0 0">With a name the alert is applied to a namespace: replace or delete it until it
-      plays; once played it self-destructs. Without a name it is sent anonymously.</p>
+      plays; once played it self-destructs. With a time it waits until then. Without a name it is sent anonymously.</p>
   </section>
 
   <section>
@@ -149,15 +150,23 @@ $("alert-send").onclick = async () => {
   if ($("alert-provider").value) body.provider = $("alert-provider").value;
   const namespace = $("alert-namespace").value.trim();
   const name = $("alert-name").value.trim();
+  const at = $("alert-at").value;
+  // A scheduled alert needs a name: it is stored in the namespace until its time.
+  if (at && !name) { show(new Error("scheduling needs a name — the alert is stored until its time")); return; }
   try {
-    // kubectl-style: a name applies the alert into a namespace, replacing any
-    // pending alert with that name; without one it is sent anonymously.
-    const r = name
-      ? await api("PUT", `/namespaces/${encodeURIComponent(namespace || "default")}/alerts/${encodeURIComponent(name)}`, body)
-      : await api("POST", "/alerts", body);
+    // kubectl-style: a name applies the alert into a namespace, replacing any stored
+    // alert with that name; `at` schedules it for that moment instead of now.
+    let r;
+    if (name) {
+      if (at) body.at = at;
+      r = await api("PUT", `/namespaces/${encodeURIComponent(namespace || "default")}/alerts/${encodeURIComponent(name)}`, body);
+    } else {
+      r = await api("POST", "/alerts", body);
+    }
     show(r.status === "suppressed" ? new Error("suppressed: " + r.reason) : null);
     $("alert-text").value = "";
     $("alert-name").value = "";
+    $("alert-at").value = "";
     refresh();
   } catch (e) { show(e); }
 };
@@ -180,24 +189,31 @@ $("namespaces").addEventListener("click", (e) => {
 function renderNamespaces(list) {
   const el = $("namespaces");
   if (!list || !list.length) {
-    el.innerHTML = `<p class="muted" style="margin:0">Empty. Alerts applied with a name wait here until they play, then self-destruct.</p>`;
+    el.innerHTML = `<p class="muted" style="margin:0">Empty. Alerts applied with a name wait here — at their time when
+      scheduled — and self-destruct once they play.</p>`;
     return;
   }
+  const when = (a) => a.due_at
+    ? new Date(a.due_at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : null;
   el.innerHTML = list.map((ns) => `
     <div class="ns">
       <div class="ns-head">
         <b>${esc(ns.name)}</b>
-        <span class="muted count">${ns.alerts.length} pending</span>
+        <span class="muted count">${ns.alerts.length} stored</span>
         <button class="del-ns" data-ns="${esc(ns.name)}">Delete namespace</button>
       </div>
-      <ul>${ns.alerts.map((a) => `
+      <ul>${ns.alerts.map((a) => {
+        const t = when(a);
+        const icon = a.state === "playing" ? "▶ " : a.state === "scheduled" ? "⏰ " : "";
+        return `
         <li>
-          <span>${a.state === "playing" ? "▶ " : ""}${esc(a.label)} <span class="tag">${esc(a.namespace)}/${esc(a.name)}</span></span>
+          <span>${icon}${esc(a.label)} <span class="tag">${esc(a.namespace)}/${esc(a.name)}</span>${t ? ` <span class="tag">${esc(t)}</span>` : ""}</span>
           <span class="row" style="flex-wrap:nowrap">
             <span class="tag ${a.priority}">${a.priority}</span>
             <button class="del-alert" data-ns="${esc(a.namespace)}" data-name="${esc(a.name)}">Delete</button>
           </span>
-        </li>`).join("")}</ul>
+        </li>`;
+      }).join("")}</ul>
     </div>`).join("");
 }
 

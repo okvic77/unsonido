@@ -5,14 +5,16 @@
 //!   DELETE /alerts/current  stop the alert that is playing
 //!   DELETE /alerts          stop it and clear the queue
 //!
-//! Namespaced alerts, kubectl-style: applying replaces a pending alert with the same
-//! name, a played alert auto-destructs out of its namespace.
+//! Namespaced alerts, kubectl-style: applying replaces a stored alert with the same
+//! name (an identical apply is a no-op), `at` schedules it for a future moment, and a
+//! played alert auto-destructs out of its namespace.
 //!   GET    /namespaces
 //!   GET    /namespaces/{ns}
 //!   GET    /namespaces/{ns}/alerts/{name}
 //!   PUT    /namespaces/{ns}/alerts/{name}    apply (POST works too)
 //!   DELETE /namespaces/{ns}/alerts/{name}
 //!   DELETE /namespaces/{ns}
+//!   PUT    /namespaces/{ns}                 sync: apply a set, prune the rest
 //!
 //!   GET    /status
 //!   PUT    /volume          {"volume": 0.0..1.0}
@@ -68,7 +70,9 @@ pub fn router(services: Services, token: Option<String>, max_body: usize) -> Rou
         .route("/namespaces", get(list_namespaces))
         .route(
             "/namespaces/{namespace}",
-            get(get_namespace).delete(delete_namespace),
+            get(get_namespace)
+                .put(replace_namespace)
+                .delete(delete_namespace),
         )
         .route(
             "/namespaces/{namespace}/alerts/{name}",
@@ -118,6 +122,8 @@ struct UploadParams {
     /// Apply kubectl-style under this namespace when `name` is also given.
     namespace: Option<String>,
     name: Option<String>,
+    /// Play at this future time instead of right away (needs namespace and name).
+    at: Option<String>,
     #[serde(default = "notification")]
     priority: AlertPriority,
     repeat: Option<u32>,
@@ -140,32 +146,35 @@ async fn upload_alert(
     if body.is_empty() {
         return error(StatusCode::BAD_REQUEST, "request body is empty");
     }
-    let extension = params.format.or_else(|| {
-        let mime = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
-        extension_for_mime(mime).map(String::from)
-    });
-    let content = Content::Audio {
-        bytes: body.to_vec(),
-        extension,
-    };
     if params.namespace.is_some() != params.name.is_some() {
         return error(
             StatusCode::BAD_REQUEST,
             "namespace and name must be given together",
         );
     }
+    if params.at.is_some() && params.name.is_none() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "`at` schedules an alert, which needs a namespace and name",
+        );
+    }
+    let extension = params.format.or_else(|| {
+        let mime = headers.get(header::CONTENT_TYPE)?.to_str().ok()?;
+        extension_for_mime(mime).map(String::from)
+    });
+    let spec = crate::alerts::AlertSpec {
+        content: Content::Audio {
+            bytes: body.to_vec(),
+            extension,
+        },
+        repeat: params.repeat.unwrap_or(1),
+        chime: params.chime,
+    };
     let result = match (params.namespace, params.name) {
         (Some(namespace), Some(name)) => {
             state
                 .alerts
-                .apply_content(
-                    namespace,
-                    name,
-                    params.priority,
-                    content,
-                    params.repeat,
-                    params.chime,
-                )
+                .apply_content(namespace, name, params.priority, spec, params.at)
                 .await
         }
         _ => {
@@ -174,9 +183,9 @@ async fn upload_alert(
                 .submit_content(
                     params.id,
                     params.priority,
-                    content,
-                    params.repeat,
-                    params.chime,
+                    spec.content,
+                    Some(spec.repeat),
+                    spec.chime,
                 )
                 .await
         }
@@ -258,6 +267,27 @@ async fn delete_namespace(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncRequest {
+    /// The whole set the namespace should hold, by alert name.
+    alerts: std::collections::BTreeMap<String, AlertRequest>,
+}
+
+/// kubectl-style sync: apply every alert in the set, prune the stored ones that are
+/// not in it. With `at` this is "upload today's calendar events" in one call.
+async fn replace_namespace(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+    Json(request): Json<SyncRequest>,
+) -> Response {
+    match state.alerts.sync_namespace(namespace, request.alerts).await {
+        Ok(report) => Json(report).into_response(),
+        Err(AlertError::Invalid(message)) => error(StatusCode::BAD_REQUEST, &message),
+        Err(err) => error(StatusCode::BAD_REQUEST, &err.message()),
+    }
+}
+
 async fn ui() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("ui.html"))
 }
@@ -328,9 +358,10 @@ async fn tts_providers(State(state): State<AppState>) -> Response {
 
 fn respond(result: Result<crate::alerts::Outcome, AlertError>) -> Response {
     match result {
-        Ok(outcome @ crate::alerts::Outcome::Queued { .. }) => {
-            (StatusCode::ACCEPTED, Json(outcome)).into_response()
-        }
+        Ok(
+            outcome @ (crate::alerts::Outcome::Queued { .. }
+            | crate::alerts::Outcome::Scheduled { .. }),
+        ) => (StatusCode::ACCEPTED, Json(outcome)).into_response(),
         Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
         Err(AlertError::Invalid(message)) => error(StatusCode::BAD_REQUEST, &message),
         Err(AlertError::QueueFull) => error(StatusCode::TOO_MANY_REQUESTS, "alert queue is full"),
