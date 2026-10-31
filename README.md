@@ -179,6 +179,33 @@ queued. Uploaded audio can be named and scheduled too: add
 The control page applies alerts the same way: fill the namespace and name fields under "Send alert",
 optionally pick a time, and manage what waits under "Namespaces" — playing, pending and scheduled.
 
+## MCP (Model Context Protocol)
+
+Agents can drive the whole alert API as discovered tools: a stateless MCP server speaks the
+"Streamable HTTP" transport on `http://127.0.0.1:7700/mcp` (JSON-RPC 2.0, plain JSON responses).
+Register it once with an agent such as Claude Code:
+
+```sh
+claude mcp add --transport http unsonido http://127.0.0.1:7700/mcp
+# with the API token enabled, send it as a header:
+claude mcp add --transport http unsonido http://127.0.0.1:7700/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+or drop it into a project's `.mcp.json`:
+
+```json
+{ "mcpServers": { "unsonido": { "type": "http", "url": "http://127.0.0.1:7700/mcp" } } }
+```
+
+The agent then gets thirteen tools mirroring the HTTP API: `play_alert` (speak now), `apply_alert`
+(store / schedule with `at`, kubectl-style), `sync_namespace` (replace a namespace wholesale),
+`get_alert`, `delete_alert`, `list_namespaces`, `delete_namespace`, `get_status`, `skip_current`,
+`clear_alerts`, `set_volume`, `play_background` and `stop_background`. Tool failures come back as
+`isError` results with the same messages the HTTP API produces. Like the rest of the control API,
+the endpoint is reachable from localhost only (and sits behind the bearer token when one is
+configured).
+
 ## Text-to-speech
 
 Providers are named instances in `[tts.providers.<name>]`, so you can define several voices of the same backend.

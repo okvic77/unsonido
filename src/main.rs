@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod engine;
 mod inputs;
+mod mcp;
 mod output;
 mod stream;
 mod taps;

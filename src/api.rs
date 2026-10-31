@@ -49,10 +49,10 @@ pub struct Services {
 }
 
 #[derive(Clone)]
-struct AppState {
-    alerts: Arc<AlertService>,
-    background: Arc<Background>,
-    airplay: Arc<AirPlay>,
+pub(crate) struct AppState {
+    pub(crate) alerts: Arc<AlertService>,
+    pub(crate) background: Arc<Background>,
+    pub(crate) airplay: Arc<AirPlay>,
     token: Option<Arc<str>>,
 }
 
@@ -64,6 +64,7 @@ pub fn router(services: Services, token: Option<String>, max_body: usize) -> Rou
         token: token.map(Into::into),
     };
     Router::new()
+        .merge(crate::mcp::router())
         .route("/alerts", post(create_alert).delete(clear_alerts))
         .route("/alerts/audio", post(upload_alert))
         .route("/alerts/current", delete(skip_alert))
