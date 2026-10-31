@@ -43,6 +43,11 @@
   li:first-child { border-top: 0; }
   .tag { font-size: 12px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); }
   .tag.critical { color: var(--warn); border-color: var(--warn); }
+  #namespaces .ns { margin-bottom: 10px; }
+  #namespaces .ns:last-child { margin-bottom: 0; }
+  #namespaces .ns-head { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  #namespaces .ns-head b { font-size: 14px; }
+  #namespaces .ns-head .count { margin-left: auto; }
   #error { color: var(--warn); min-height: 1em; }
 </style>
 </head>
@@ -83,6 +88,17 @@
       <select id="alert-provider" style="width:auto"></select>
       <button class="primary" id="alert-send">Send</button>
     </div>
+    <div class="row" style="margin-top:8px">
+      <input id="alert-namespace" type="text" placeholder="namespace (default)" style="flex:0 1 150px">
+      <input id="alert-name" type="text" placeholder="name — store it in the namespace (kubectl-style)" class="grow">
+    </div>
+    <p class="muted" style="margin:8px 0 0">With a name the alert is applied to a namespace: replace or delete it until it
+      plays; once played it self-destructs. Without a name it is sent anonymously.</p>
+  </section>
+
+  <section>
+    <div class="row"><h2 class="grow">Namespaces</h2></div>
+    <div id="namespaces"></div>
   </section>
 
   <section>
@@ -131,12 +147,59 @@ $("bg-stop").onclick = async () => { try { await api("DELETE", "/background"); s
 $("alert-send").onclick = async () => {
   const body = { text: $("alert-text").value, priority: $("alert-priority").value };
   if ($("alert-provider").value) body.provider = $("alert-provider").value;
-  try { const r = await api("POST", "/alerts", body); show(r.status === "suppressed" ? new Error("suppressed: " + r.reason) : null); $("alert-text").value = ""; refresh(); }
-  catch (e) { show(e); }
+  const namespace = $("alert-namespace").value.trim();
+  const name = $("alert-name").value.trim();
+  try {
+    // kubectl-style: a name applies the alert into a namespace, replacing any
+    // pending alert with that name; without one it is sent anonymously.
+    const r = name
+      ? await api("PUT", `/namespaces/${encodeURIComponent(namespace || "default")}/alerts/${encodeURIComponent(name)}`, body)
+      : await api("POST", "/alerts", body);
+    show(r.status === "suppressed" ? new Error("suppressed: " + r.reason) : null);
+    $("alert-text").value = "";
+    $("alert-name").value = "";
+    refresh();
+  } catch (e) { show(e); }
 };
 $("skip").onclick = () => api("DELETE", "/alerts/current").then(refresh, show);
 $("clear").onclick = () => api("DELETE", "/alerts").then(refresh, show);
 $("token-save").onclick = () => { token = $("token").value; try { localStorage.setItem("unsonido-token", token); } catch {} loadProviders(); refresh(); };
+
+// Namespace entries: delete one alert or a whole namespace.
+$("namespaces").addEventListener("click", (e) => {
+  const delAlert = e.target.closest(".del-alert");
+  if (delAlert) {
+    const path = `/namespaces/${encodeURIComponent(delAlert.dataset.ns)}/alerts/${encodeURIComponent(delAlert.dataset.name)}`;
+    api("DELETE", path).then(refresh, show);
+    return;
+  }
+  const delNs = e.target.closest(".del-ns");
+  if (delNs) api("DELETE", `/namespaces/${encodeURIComponent(delNs.dataset.ns)}`).then(refresh, show);
+});
+
+function renderNamespaces(list) {
+  const el = $("namespaces");
+  if (!list || !list.length) {
+    el.innerHTML = `<p class="muted" style="margin:0">Empty. Alerts applied with a name wait here until they play, then self-destruct.</p>`;
+    return;
+  }
+  el.innerHTML = list.map((ns) => `
+    <div class="ns">
+      <div class="ns-head">
+        <b>${esc(ns.name)}</b>
+        <span class="muted count">${ns.alerts.length} pending</span>
+        <button class="del-ns" data-ns="${esc(ns.name)}">Delete namespace</button>
+      </div>
+      <ul>${ns.alerts.map((a) => `
+        <li>
+          <span>${a.state === "playing" ? "▶ " : ""}${esc(a.label)} <span class="tag">${esc(a.namespace)}/${esc(a.name)}</span></span>
+          <span class="row" style="flex-wrap:nowrap">
+            <span class="tag ${a.priority}">${a.priority}</span>
+            <button class="del-alert" data-ns="${esc(a.namespace)}" data-name="${esc(a.name)}">Delete</button>
+          </span>
+        </li>`).join("")}</ul>
+    </div>`).join("");
+}
 
 async function loadProviders() {
   try {
@@ -215,9 +278,12 @@ async function refresh() {
     : "Nothing playing";
   if (bgUrls.length && document.activeElement !== $("bg-url") && !$("bg-url").value) $("bg-url").value = bgUrls.join("\n");
 
+  const namedTag = (a) => a.namespace ? ` <span class="tag">${esc(a.namespace)}/${esc(a.name)}</span>` : "";
+  renderNamespaces(s.namespaces);
+
   const items = [];
-  if (s.current) items.push(`<li><span>▶ ${esc(s.current.label)}</span><span class="tag ${s.current.priority}">${s.current.priority}</span></li>`);
-  for (const a of s.queue) items.push(`<li><span class="muted">queued · ${esc(a.label)}</span><span class="tag ${a.priority}">${a.priority}</span></li>`);
+  if (s.current) items.push(`<li><span>▶ ${esc(s.current.label)}${namedTag(s.current)}</span><span class="tag ${s.current.priority}">${s.current.priority}</span></li>`);
+  for (const a of s.queue) items.push(`<li><span class="muted">queued · ${esc(a.label)}${namedTag(a)}</span><span class="tag ${a.priority}">${a.priority}</span></li>`);
   for (const h of s.history.slice(0, 8)) items.push(`<li><span class="muted">${new Date(h.at).toLocaleTimeString()} · ${esc(h.label)}</span><span class="tag">${h.result}</span></li>`);
   $("alerts").innerHTML = items.join("") || `<li class="muted">No alerts yet</li>`;
 }

@@ -1,7 +1,12 @@
 //! Turns alert requests into rendered clips, applies policy (quiet hours, dedupe, queue limits),
 //! hands them to the mixer, and tracks what is queued and playing.
+//!
+//! Alerts can be posted anonymously, or applied kubectl-style into a namespace under a name
+//! (`calendar`, `agents`, `script`, ...). A named alert replaces a pending one with the same
+//! name, can be deleted before it plays, and auto-destructs out of its namespace once played.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -88,6 +93,11 @@ pub struct AlertInfo {
     pub id: String,
     pub priority: AlertPriority,
     pub label: String,
+    /// Set for alerts applied kubectl-style into a namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -96,6 +106,28 @@ pub struct HistoryEntry {
     pub alert: AlertInfo,
     pub result: FinishReason,
     pub at: String,
+}
+
+/// A named alert waiting to play, by namespace then name; auto-destructs once played.
+#[derive(Clone, Serialize)]
+pub struct StoredAlert {
+    #[serde(flatten)]
+    pub info: AlertInfo,
+    /// "playing" or "pending".
+    pub state: StoredState,
+}
+
+#[derive(Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredState {
+    Playing,
+    Pending,
+}
+
+#[derive(Serialize)]
+pub struct NamespaceInfo {
+    pub name: String,
+    pub alerts: Vec<StoredAlert>,
 }
 
 #[derive(Serialize)]
@@ -109,6 +141,7 @@ pub struct Status {
     pub current: Option<AlertInfo>,
     pub queue: Vec<AlertInfo>,
     pub history: Vec<HistoryEntry>,
+    pub namespaces: Vec<NamespaceInfo>,
 }
 
 #[derive(Default)]
@@ -118,7 +151,19 @@ struct State {
     history: VecDeque<HistoryEntry>,
     /// Explicit ids seen recently, for deduplication.
     recent: HashMap<String, Instant>,
+    /// Named alerts waiting to play, by namespace then name. Entries auto-destruct
+    /// when the alert finishes.
+    namespaces: BTreeMap<String, BTreeMap<String, AlertInfo>>,
     volume: f32,
+}
+
+/// How a submission is tracked: anonymous, or kubectl-style inside a namespace.
+enum Identity {
+    /// Deduplicated on an explicit id when given; anonymous otherwise.
+    Plain { id: Option<String> },
+    /// Registered under (namespace, name). Applying replaces a pending alert with
+    /// that name; the entry auto-destructs once the alert has played.
+    Named { namespace: String, name: String },
 }
 
 pub struct AlertService {
@@ -132,6 +177,9 @@ pub struct AlertService {
     state: Mutex<State>,
     /// True while a critical alert is playing or queued.
     critical: tokio::sync::watch::Sender<bool>,
+    /// Makes each named alert's engine id unique, so a replaced alert can be
+    /// cancelled while its replacement is already queued.
+    named_seq: AtomicU64,
 }
 
 impl AlertService {
@@ -166,6 +214,7 @@ impl AlertService {
             levels,
             state: Mutex::new(state),
             critical,
+            named_seq: AtomicU64::new(0),
         }))
     }
 
@@ -222,6 +271,12 @@ impl AlertService {
                     });
                     state.history.truncate(HISTORY_LEN);
                 }
+                // Auto-destruct: a played alert leaves its namespace, and an empty
+                // namespace disappears with it.
+                state.namespaces.retain(|_, alerts| {
+                    alerts.retain(|_, a| a.id != alert.id);
+                    !alerts.is_empty()
+                });
             }
             // Dropping it here (off the audio thread) also stops its decoder thread.
             Event::SourceRemoved(source) => drop(source),
@@ -236,32 +291,9 @@ impl AlertService {
     }
 
     pub async fn submit(&self, request: AlertRequest) -> Result<Outcome, AlertError> {
-        let content = match (request.text, request.url) {
-            (Some(_), Some(_)) => {
-                return Err(AlertError::Invalid(
-                    "use either `text` or `url`, not both".into(),
-                ));
-            }
-            (Some(text), None) => {
-                if text.trim().is_empty() {
-                    return Err(AlertError::Invalid("`text` is empty".into()));
-                }
-                Content::Text {
-                    text,
-                    provider: request.provider,
-                    voice: request.voice,
-                }
-            }
-            (None, Some(url)) => Content::Url(url),
-            (None, None) if request.chime != Some(false) => Content::ChimeOnly,
-            (None, None) => {
-                return Err(AlertError::Invalid(
-                    "nothing to play: give `text` or `url`".into(),
-                ));
-            }
-        };
-        self.submit_content(
-            request.id,
+        let content = content_of(&request)?;
+        self.enqueue_alert(
+            Identity::Plain { id: request.id },
             request.priority,
             content,
             request.repeat,
@@ -270,9 +302,64 @@ impl AlertService {
         .await
     }
 
+    /// kubectl-style: apply an alert under (namespace, name). A pending alert with the
+    /// same name is replaced; the entry auto-destructs once the alert has played.
+    pub async fn apply(
+        &self,
+        namespace: String,
+        name: String,
+        request: AlertRequest,
+    ) -> Result<Outcome, AlertError> {
+        validate_name(&namespace, "namespace")?;
+        validate_name(&name, "name")?;
+        let content = content_of(&request)?;
+        self.enqueue_alert(
+            Identity::Named { namespace, name },
+            request.priority,
+            content,
+            request.repeat,
+            request.chime.unwrap_or(true),
+        )
+        .await
+    }
+
+    /// Like [`apply`](Self::apply), but with already-built content (uploaded audio).
+    pub async fn apply_content(
+        &self,
+        namespace: String,
+        name: String,
+        priority: AlertPriority,
+        content: Content,
+        repeat: Option<u32>,
+        chime: bool,
+    ) -> Result<Outcome, AlertError> {
+        validate_name(&namespace, "namespace")?;
+        validate_name(&name, "name")?;
+        self.enqueue_alert(
+            Identity::Named { namespace, name },
+            priority,
+            content,
+            repeat,
+            chime,
+        )
+        .await
+    }
+
     pub async fn submit_content(
         &self,
         id: Option<String>,
+        priority: AlertPriority,
+        content: Content,
+        repeat: Option<u32>,
+        chime: bool,
+    ) -> Result<Outcome, AlertError> {
+        self.enqueue_alert(Identity::Plain { id }, priority, content, repeat, chime)
+            .await
+    }
+
+    async fn enqueue_alert(
+        &self,
+        identity: Identity,
         priority: AlertPriority,
         content: Content,
         repeat: Option<u32>,
@@ -292,8 +379,18 @@ impl AlertService {
         {
             return Err(AlertError::Invalid(format!("unknown tts provider {p:?}")));
         }
-        let explicit_id = id.is_some();
-        let id = id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let (id, explicit_id) = match &identity {
+            Identity::Plain { id } => (
+                id.clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                id.is_some(),
+            ),
+            // "<ns>/<name>#<n>" reads well in logs and stays unique across replaces.
+            Identity::Named { namespace, name } => {
+                let n = self.named_seq.fetch_add(1, Ordering::Relaxed);
+                (format!("{namespace}/{name}#{n}"), false)
+            }
+        };
 
         if priority == AlertPriority::Notification && self.quiet_hours_active() {
             return Ok(Outcome::Suppressed {
@@ -301,6 +398,30 @@ impl AlertService {
                 reason: "quiet_hours",
             });
         }
+
+        // Replace: a pending alert with the same name is cancelled first. If the new
+        // render then fails, the old one is already gone — last apply wins.
+        if let Identity::Named { namespace, name } = &identity {
+            let old = {
+                let mut state = self.state.lock().unwrap();
+                let old = state
+                    .namespaces
+                    .get_mut(namespace)
+                    .and_then(|alerts| alerts.remove(name));
+                if state
+                    .namespaces
+                    .get(namespace)
+                    .is_some_and(|alerts| alerts.is_empty())
+                {
+                    state.namespaces.remove(namespace);
+                }
+                old
+            };
+            if let Some(old) = old {
+                let _ = self.commands.try_send(Command::CancelAlert(old.id));
+            }
+        }
+
         {
             let mut state = self.state.lock().unwrap();
             if state.queue.len() >= self.cfg.max_queue {
@@ -338,13 +459,29 @@ impl AlertService {
         };
 
         let duration_ms = (audio.len() / audio::CHANNELS) as u64 * 1000 / self.rate as u64;
+        let (namespace, name) = match &identity {
+            Identity::Named { namespace, name } => (Some(namespace.clone()), Some(name.clone())),
+            Identity::Plain { .. } => (None, None),
+        };
         let info = AlertInfo {
             id: id.clone(),
             priority,
             label,
+            namespace,
+            name,
         };
         // Track it before the mixer can report it started.
-        self.state.lock().unwrap().queue.push(info);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.queue.push(info.clone());
+            if let Identity::Named { namespace, name } = &identity {
+                state
+                    .namespaces
+                    .entry(namespace.clone())
+                    .or_default()
+                    .insert(name.clone(), info.clone());
+            }
+        }
         let prepared = PreparedAlert {
             id: id.clone(),
             priority,
@@ -353,6 +490,14 @@ impl AlertService {
         if let Err(err) = self.commands.try_send(Command::Enqueue(prepared)) {
             let mut state = self.state.lock().unwrap();
             state.queue.retain(|a| a.id != id);
+            if let Identity::Named { namespace, name } = &identity
+                && let Some(alerts) = state.namespaces.get_mut(namespace)
+            {
+                alerts.remove(name);
+                if alerts.is_empty() {
+                    state.namespaces.remove(namespace);
+                }
+            }
             return Err(match err {
                 TrySendError::Full(_) => AlertError::QueueFull,
                 TrySendError::Disconnected(_) => {
@@ -495,12 +640,156 @@ impl AlertService {
             current: state.current.clone(),
             queue: state.queue.clone(),
             history: state.history.iter().cloned().collect(),
+            namespaces: namespaces_view(&state),
+        }
+    }
+
+    /// Every namespace and its pending alerts, e.g. `calendar`, `agents`, `script`.
+    pub fn list_namespaces(&self) -> Vec<NamespaceInfo> {
+        let state = self.state.lock().unwrap();
+        namespaces_view(&state)
+    }
+
+    /// The alerts of one namespace, playing ones first. None when it does not exist.
+    pub fn namespace_alerts(&self, namespace: &str) -> Option<Vec<StoredAlert>> {
+        let state = self.state.lock().unwrap();
+        state
+            .namespaces
+            .get(namespace)
+            .map(|alerts| stored_alerts(&state, alerts))
+    }
+
+    /// One stored alert. None when it does not exist.
+    pub fn stored_alert(&self, namespace: &str, name: &str) -> Option<StoredAlert> {
+        let state = self.state.lock().unwrap();
+        state
+            .namespaces
+            .get(namespace)
+            .and_then(|alerts| alerts.get(name))
+            .map(|info| stored_alert(&state, info))
+    }
+
+    /// Delete a stored alert: it stops playing or leaves the queue. False when it
+    /// does not exist.
+    pub fn delete_alert(&self, namespace: &str, name: &str) -> bool {
+        let id = {
+            let mut state = self.state.lock().unwrap();
+            let removed = state
+                .namespaces
+                .get_mut(namespace)
+                .and_then(|alerts| alerts.remove(name));
+            if removed.is_some()
+                && state
+                    .namespaces
+                    .get(namespace)
+                    .is_some_and(|alerts| alerts.is_empty())
+            {
+                state.namespaces.remove(namespace);
+            }
+            removed
+        };
+        if let Some(info) = id {
+            let _ = self.commands.try_send(Command::CancelAlert(info.id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete a namespace and every alert in it. False when it does not exist.
+    pub fn delete_namespace(&self, namespace: &str) -> bool {
+        let ids = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .namespaces
+                .remove(namespace)
+                .map(|alerts| alerts.into_values().map(|a| a.id).collect::<Vec<_>>())
+        };
+        match ids {
+            Some(ids) => {
+                for id in ids {
+                    let _ = self.commands.try_send(Command::CancelAlert(id));
+                }
+                true
+            }
+            None => false,
         }
     }
 
     fn quiet_hours_active(&self) -> bool {
         self.quiet_hours
             .is_some_and(|(start, end)| in_window(Local::now().time(), start, end))
+    }
+}
+
+/// Build the content of a request: text to speak, an audio url, or a chime only.
+fn content_of(request: &AlertRequest) -> Result<Content, AlertError> {
+    match (&request.text, &request.url) {
+        (Some(_), Some(_)) => Err(AlertError::Invalid(
+            "use either `text` or `url`, not both".into(),
+        )),
+        (Some(text), None) => {
+            if text.trim().is_empty() {
+                return Err(AlertError::Invalid("`text` is empty".into()));
+            }
+            Ok(Content::Text {
+                text: text.clone(),
+                provider: request.provider.clone(),
+                voice: request.voice.clone(),
+            })
+        }
+        (None, Some(url)) => Ok(Content::Url(url.clone())),
+        (None, None) if request.chime != Some(false) => Ok(Content::ChimeOnly),
+        (None, None) => Err(AlertError::Invalid(
+            "nothing to play: give `text` or `url`".into(),
+        )),
+    }
+}
+
+/// Namespaces and names may be anything except empty, too long, or containing '/'.
+fn validate_name(value: &str, what: &str) -> Result<(), AlertError> {
+    if value.trim().is_empty() {
+        return Err(AlertError::Invalid(format!("`{what}` must not be empty")));
+    }
+    if value.len() > 100 {
+        return Err(AlertError::Invalid(format!("`{what}` is too long")));
+    }
+    if value.contains('/') {
+        return Err(AlertError::Invalid(format!(
+            "`{what}` must not contain '/'"
+        )));
+    }
+    Ok(())
+}
+
+/// Snapshot of the namespaces for the status and the listing endpoints.
+fn namespaces_view(state: &State) -> Vec<NamespaceInfo> {
+    state
+        .namespaces
+        .iter()
+        .map(|(name, alerts)| NamespaceInfo {
+            name: name.clone(),
+            alerts: stored_alerts(state, alerts),
+        })
+        .collect()
+}
+
+fn stored_alerts(state: &State, alerts: &BTreeMap<String, AlertInfo>) -> Vec<StoredAlert> {
+    alerts
+        .values()
+        .map(|info| stored_alert(state, info))
+        .collect()
+}
+
+fn stored_alert(state: &State, info: &AlertInfo) -> StoredAlert {
+    let state_ = if state.current.as_ref().is_some_and(|c| c.id == info.id) {
+        StoredState::Playing
+    } else {
+        StoredState::Pending
+    };
+    StoredAlert {
+        info: info.clone(),
+        state: state_,
     }
 }
 
@@ -536,5 +825,39 @@ mod tests {
         assert!(!in_window(t("07:00"), t("22:00"), t("07:00")));
         assert!(!in_window(t("12:00"), t("22:00"), t("07:00")));
         assert!(in_window(t("13:00"), t("12:00"), t("14:00")));
+    }
+
+    fn request(json: &str) -> AlertRequest {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn named_alerts_validate_their_namespace_and_name() {
+        assert!(validate_name("calendar", "namespace").is_ok());
+        assert!(validate_name("a b.c-d_e", "name").is_ok());
+        assert!(validate_name("", "name").is_err());
+        assert!(validate_name("  ", "name").is_err());
+        assert!(validate_name("has/slash", "name").is_err());
+        assert!(validate_name(&"x".repeat(101), "name").is_err());
+    }
+
+    #[test]
+    fn content_of_builds_text_url_and_chime() {
+        assert!(matches!(
+            content_of(&request(r#"{"text":"hello"}"#)).unwrap(),
+            Content::Text { .. }
+        ));
+        assert!(matches!(
+            content_of(&request(r#"{"url":"https://x.example/a.mp3"}"#)).unwrap(),
+            Content::Url(_)
+        ));
+        assert!(matches!(
+            content_of(&request("{}")).unwrap(),
+            Content::ChimeOnly
+        ));
+        // Both, or chime=false with nothing else, are rejected.
+        assert!(content_of(&request(r#"{"text":"hi","url":"https://x.example/a.mp3"}"#)).is_err());
+        assert!(content_of(&request(r#"{"chime":false}"#)).is_err());
+        assert!(content_of(&request(r#"{"text":"  "}"#)).is_err());
     }
 }

@@ -40,6 +40,9 @@ pub enum Command {
     Skip,
     /// Stop the current alert and drop everything queued.
     Clear,
+    /// Stop the alert with this id, queued or playing. Used to delete a named alert
+    /// or to replace it with a newer apply.
+    CancelAlert(String),
     SetVolume(f32),
     /// Add an input, replacing any existing input with the same name.
     AddSource {
@@ -56,6 +59,8 @@ pub enum FinishReason {
     Completed,
     Skipped,
     Cleared,
+    /// Removed by a delete or replaced by a newer apply.
+    Cancelled,
 }
 
 pub enum Event {
@@ -371,6 +376,18 @@ impl Mixer {
                     self.queue.insert(index, alert);
                 }
                 Command::Skip => self.finish_current(FinishReason::Skipped),
+                Command::CancelAlert(id) => {
+                    if let Some(pos) = self.queue.iter().position(|a| a.id == id) {
+                        if let Some(alert) = self.queue.remove(pos) {
+                            self.emit(Event::Finished {
+                                alert,
+                                reason: FinishReason::Cancelled,
+                            });
+                        }
+                    } else if self.current.as_ref().is_some_and(|p| p.alert.id == id) {
+                        self.finish_current(FinishReason::Cancelled);
+                    }
+                }
                 Command::Clear => {
                     self.finish_current(FinishReason::Cleared);
                     while let Some(alert) = self.queue.pop_front() {
@@ -612,5 +629,60 @@ mod tests {
             })
             .count();
         assert_eq!(cleared, 3);
+    }
+
+    #[test]
+    fn cancel_removes_queued_and_playing_alerts() {
+        let (mut m, tx, events) = mixer();
+        tx.send(Command::Enqueue(alert(
+            "a",
+            AlertPriority::Notification,
+            500,
+        )))
+        .unwrap();
+        tx.send(Command::Enqueue(alert(
+            "b",
+            AlertPriority::Notification,
+            50,
+        )))
+        .unwrap();
+        render(&mut m, 50); // "a" is playing, "b" is queued
+
+        tx.send(Command::CancelAlert("a".into())).unwrap();
+        tx.send(Command::CancelAlert("b".into())).unwrap();
+        render(&mut m, 1);
+
+        let ids: Vec<String> = events
+            .try_iter()
+            .filter_map(|e| match e {
+                Event::Finished {
+                    alert,
+                    reason: FinishReason::Cancelled,
+                } => Some(format!("cancel:{}", alert.id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["cancel:a", "cancel:b"]);
+
+        // Nothing is left to play: the release tail runs out, the bed ramps back up
+        // and the mix is only the bed again.
+        render(&mut m, 50); // release delay runs out at the end of this block
+        let out = render(&mut m, 20); // duck ramps back up
+        assert!((out[15 * CHANNELS] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn cancel_of_unknown_id_is_a_noop() {
+        let (mut m, tx, events) = mixer();
+        tx.send(Command::Enqueue(alert(
+            "a",
+            AlertPriority::Notification,
+            50,
+        )))
+        .unwrap();
+        tx.send(Command::CancelAlert("nope".into())).unwrap();
+        render(&mut m, 5);
+        assert!(matches!(events.try_recv(), Ok(Event::Started { .. })));
+        assert!(events.try_recv().is_err(), "no spurious events");
     }
 }

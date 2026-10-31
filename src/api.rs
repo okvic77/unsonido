@@ -4,6 +4,16 @@
 //!   POST   /alerts/audio    raw audio body; options in the query string
 //!   DELETE /alerts/current  stop the alert that is playing
 //!   DELETE /alerts          stop it and clear the queue
+//!
+//! Namespaced alerts, kubectl-style: applying replaces a pending alert with the same
+//! name, a played alert auto-destructs out of its namespace.
+//!   GET    /namespaces
+//!   GET    /namespaces/{ns}
+//!   GET    /namespaces/{ns}/alerts/{name}
+//!   PUT    /namespaces/{ns}/alerts/{name}    apply (POST works too)
+//!   DELETE /namespaces/{ns}/alerts/{name}
+//!   DELETE /namespaces/{ns}
+//!
 //!   GET    /status
 //!   PUT    /volume          {"volume": 0.0..1.0}
 //!   PUT    /background      {"url": "..."} or {"file": "..."}, optional "gain_db"
@@ -55,6 +65,18 @@ pub fn router(services: Services, token: Option<String>, max_body: usize) -> Rou
         .route("/alerts", post(create_alert).delete(clear_alerts))
         .route("/alerts/audio", post(upload_alert))
         .route("/alerts/current", delete(skip_alert))
+        .route("/namespaces", get(list_namespaces))
+        .route(
+            "/namespaces/{namespace}",
+            get(get_namespace).delete(delete_namespace),
+        )
+        .route(
+            "/namespaces/{namespace}/alerts/{name}",
+            get(get_stored_alert)
+                .put(apply_alert)
+                .post(apply_alert)
+                .delete(delete_stored_alert),
+        )
         .route("/status", get(status))
         .route("/volume", put(set_volume))
         .route("/background", put(play_background).delete(stop_background))
@@ -93,6 +115,9 @@ async fn create_alert(
 #[serde(deny_unknown_fields)]
 struct UploadParams {
     id: Option<String>,
+    /// Apply kubectl-style under this namespace when `name` is also given.
+    namespace: Option<String>,
+    name: Option<String>,
     #[serde(default = "notification")]
     priority: AlertPriority,
     repeat: Option<u32>,
@@ -123,18 +148,40 @@ async fn upload_alert(
         bytes: body.to_vec(),
         extension,
     };
-    respond(
-        state
-            .alerts
-            .submit_content(
-                params.id,
-                params.priority,
-                content,
-                params.repeat,
-                params.chime,
-            )
-            .await,
-    )
+    if params.namespace.is_some() != params.name.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "namespace and name must be given together",
+        );
+    }
+    let result = match (params.namespace, params.name) {
+        (Some(namespace), Some(name)) => {
+            state
+                .alerts
+                .apply_content(
+                    namespace,
+                    name,
+                    params.priority,
+                    content,
+                    params.repeat,
+                    params.chime,
+                )
+                .await
+        }
+        _ => {
+            state
+                .alerts
+                .submit_content(
+                    params.id,
+                    params.priority,
+                    content,
+                    params.repeat,
+                    params.chime,
+                )
+                .await
+        }
+    };
+    respond(result)
 }
 
 fn extension_for_mime(mime: &str) -> Option<&'static str> {
@@ -157,6 +204,58 @@ async fn skip_alert(State(state): State<AppState>) -> StatusCode {
 async fn clear_alerts(State(state): State<AppState>) -> StatusCode {
     state.alerts.clear();
     StatusCode::NO_CONTENT
+}
+
+async fn list_namespaces(State(state): State<AppState>) -> Response {
+    Json(json!(state.alerts.list_namespaces())).into_response()
+}
+
+async fn get_namespace(State(state): State<AppState>, Path(namespace): Path<String>) -> Response {
+    match state.alerts.namespace_alerts(&namespace) {
+        Some(alerts) => Json(json!({ "name": namespace, "alerts": alerts })).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such namespace"),
+    }
+}
+
+async fn get_stored_alert(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Response {
+    match state.alerts.stored_alert(&namespace, &name) {
+        Some(alert) => Json(alert).into_response(),
+        None => error(StatusCode::NOT_FOUND, "no such alert"),
+    }
+}
+
+/// kubectl-style apply: create the alert, or replace a pending one with the same name.
+async fn apply_alert(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+    Json(request): Json<AlertRequest>,
+) -> Response {
+    respond(state.alerts.apply(namespace, name, request).await)
+}
+
+async fn delete_stored_alert(
+    State(state): State<AppState>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Response {
+    if state.alerts.delete_alert(&namespace, &name) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "no such alert")
+    }
+}
+
+async fn delete_namespace(
+    State(state): State<AppState>,
+    Path(namespace): Path<String>,
+) -> Response {
+    if state.alerts.delete_namespace(&namespace) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "no such namespace")
+    }
 }
 
 async fn ui() -> axum::response::Html<&'static str> {

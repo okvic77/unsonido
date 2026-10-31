@@ -106,6 +106,41 @@ control page asks for the token once and keeps it in the browser.
 Responses: `202 {"status":"queued","id",...}` when queued, `200 {"status":"suppressed","reason":"duplicate"|"quiet_hours"}`
 when policy drops the alert, `400` for invalid input, `429` when the queue is full and `502` when TTS or a download fails.
 
+## Alert namespaces (kubectl-style)
+
+Alerts can be applied into a namespace under a name — `calendar`, `agents`, `script`, … — like kubectl
+resources. Applying queues the alert for playback and stores it; applying the same name again replaces
+the pending alert; deleting cancels it (or stops it if it is playing); and once an alert has played it
+self-destructs out of its namespace. A namespace exists while it holds pending alerts.
+
+```sh
+# Apply: play it, and keep it as calendar/standup until it does.
+curl -X PUT localhost:7700/namespaces/calendar/alerts/standup \
+  -H 'content-type: application/json' -d '{"text":"Standup in two minutes"}'
+
+# POST works too; re-applying the same name replaces the pending alert.
+curl -X POST localhost:7700/namespaces/agents/alerts/task-done \
+  -H 'content-type: application/json' -d '{"text":"Task done","priority":"critical"}'
+
+# List: everything, one namespace, one alert.
+curl localhost:7700/namespaces
+curl localhost:7700/namespaces/calendar
+curl localhost:7700/namespaces/calendar/alerts/standup
+
+# Delete: a waiting alert leaves the queue, a playing one is stopped.
+curl -X DELETE localhost:7700/namespaces/calendar/alerts/standup
+curl -X DELETE localhost:7700/namespaces/calendar   # the namespace and everything in it
+```
+
+Named alerts take the same body as `POST /alerts` (`text`, `url`, `priority`, `provider`, `voice`,
+`repeat`, `chime`) and the same policies (quiet hours, queue limits). They skip `id`-deduplication —
+re-applying a name is an explicit replace. The engine id is `<namespace>/<name>#<n>`, so a replaced
+alert can be cancelled while its replacement is already queued. Uploaded audio can be named too:
+add `?namespace=calendar&name=doorbell` to `POST /alerts/audio`.
+
+The control page applies alerts the same way: fill the namespace and name fields under "Send alert"
+and manage what waits under "Namespaces".
+
 ## Text-to-speech
 
 Providers are named instances in `[tts.providers.<name>]`, so you can define several voices of the same backend.
