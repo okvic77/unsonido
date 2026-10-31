@@ -1,0 +1,152 @@
+# unsonido
+
+An audio bus for one room. AirPlay speakers, a radio/Icecast background and spoken alerts are
+mixed into one output, using priority rules.
+
+| Layer | Sources | Behaviour |
+|---|---|---|
+| background | Icecast/radio stream or looped file | plays when nothing above is active |
+| foreground | AirPlay receivers (several at once, mixed) | crossfades the background out |
+| notification | calendar reminders, chimes | ducks the layers below (-15 dB), then fades back |
+| critical | alarms, outages | mutes everything else, raises master volume, preempts notifications |
+
+## Run
+
+```sh
+cp unsonido.example.toml unsonido.toml
+cargo run --release -- --config unsonido.toml
+cargo run --release -- devices        # list output devices
+```
+
+Open <http://localhost:7700/> for the control page: volume, AirPlay status, background stream, alerts.
+
+The example config defines two AirPlay speakers, **Unsonido Sala** and **Unsonido Cocina**. Pick
+one in the AirPlay menu of an iPhone, iPad or Mac (Control Center → AirPlay, or the AirPlay
+button in Music). Two devices can stream at once, one per speaker, and both are mixed. Add more
+`[[airplay.receivers]]` for more simultaneous senders.
+
+macOS asks once to allow incoming connections; allow it, or senders can't connect. Logging is
+controlled with `RUST_LOG` (default `unsonido=info`; `unsonido=debug` shows the AirPlay protocol).
+
+### Linux
+
+Bonjour advertising uses Avahi's DNS-SD compatibility library:
+`sudo apt install libavahi-compat-libdnssd-dev libasound2-dev` (Debian/Ubuntu). With
+`[output] type = "null"` plus a pipe output, a headless server can publish the mix to Icecast.
+
+## AirPlay
+
+AirPlay 1 (RAOP), the same protocol shairport-sync's classic mode speaks. iOS, iPadOS and macOS
+still stream to AirPlay 1 speakers.
+
+- Encrypted (RSA + AES) and unencrypted sessions; ALAC and PCM audio.
+- The sender's volume slider controls that speaker's level (`airplay.volume_range_db`).
+- Lost packets are re-requested from the sender, and concealed with silence if they don't arrive.
+- Audio plays on the sender's schedule (sync packets + clock exchange), so video apps like YouTube
+  stay in lip sync. If your output device adds noticeable delay, trim it with `airplay.audio_delay_ms`.
+- Clock drift between sender and output is corrected by dropping or repeating single frames.
+- A new sender on a busy speaker takes it over.
+- The track title, artist and album the sender transmits show in `/status` and on the control page.
+- During a critical alert, playing senders are paused through their remote-control service (DACP)
+  and resumed when the alert ends (`airplay.pause_on_critical`, on by default). The Music app on
+  macOS and iOS apps that publish remote controls support this; others just get ducked.
+
+AirPlay 2-only features (multi-room sync, HomeKit pairing) are not supported.
+
+## Background (radio / Icecast)
+
+```sh
+curl -X PUT localhost:7700/background -H 'content-type: application/json' \
+  -d '{"url":"https://ice1.somafm.com/groovesalad-128-mp3","gain_db":-6}'
+# Fallbacks: tried in order when the ones before them fail; after an outage it returns to the first.
+curl -X PUT localhost:7700/background -H 'content-type: application/json' \
+  -d '{"urls":["https://ice5.somafm.com/groovesalad-128-mp3","https://ice1.somafm.com/groovesalad-128-mp3"]}'
+curl -X PUT localhost:7700/background -H 'content-type: application/json' -d '{"file":"/path/song.mp3"}'
+curl -X DELETE localhost:7700/background
+```
+
+MP3, AAC, Ogg Vorbis, FLAC and WAV streams are supported. The "now playing" title from Icecast
+metadata shows in `/status`. Dropped streams reconnect with backoff.
+
+## Pipe outputs (Icecast out, recording)
+
+`[[pipe_outputs]]` pipes a copy of the final mix as raw f32le stereo into any program. The example
+config publishes to an Icecast server with ffmpeg; the same works for recording to a file. If the
+program exits, it is restarted.
+
+## Alert API
+
+```sh
+# Spoken notification (chime + TTS). `id` deduplicates repeats for `alerts.dedupe_seconds`.
+curl -X POST localhost:7700/alerts -H 'content-type: application/json' \
+  -d '{"id":"cal:standup:2min","text":"Standup in two minutes"}'
+
+# Critical, repeated, with a specific provider and voice.
+curl -X POST localhost:7700/alerts -H 'content-type: application/json' \
+  -d '{"priority":"critical","text":"Production is down","provider":"eleven","repeat":2}'
+
+# Play an audio file from a URL, or just a chime.
+curl -X POST localhost:7700/alerts -H 'content-type: application/json' -d '{"url":"https://example.com/doorbell.mp3"}'
+curl -X POST localhost:7700/alerts -H 'content-type: application/json' -d '{}'
+
+# Upload audio you generated yourself (wav, mp3, aiff, flac, ogg, m4a).
+curl -X POST 'localhost:7700/alerts/audio?priority=critical&chime=true' \
+  -H 'content-type: audio/mpeg' --data-binary @alert.mp3
+
+curl -X DELETE localhost:7700/alerts/current   # stop the alert playing now
+curl -X DELETE localhost:7700/alerts           # stop it and clear the queue
+curl -X PUT localhost:7700/volume -H 'content-type: application/json' -d '{"volume":0.6}'
+curl localhost:7700/status
+curl localhost:7700/tts/providers
+```
+
+When `server.token` or `server.token_env` is set, send `Authorization: Bearer <token>`. The
+control page asks for the token once and keeps it in the browser.
+
+Responses: `202 {"status":"queued","id",...}` when queued, `200 {"status":"suppressed","reason":"duplicate"|"quiet_hours"}`
+when policy drops the alert, `400` for invalid input, `429` when the queue is full and `502` when TTS or a download fails.
+
+## Text-to-speech
+
+Providers are named instances in `[tts.providers.<name>]`, so you can define several voices of the same backend.
+
+- `say`: macOS built-in.
+- `command`: any local program (Piper, espeak-ng, custom scripts). Placeholders: `{output}`, `{text}`, `{voice}`.
+- `elevenlabs`: ElevenLabs API.
+- `openai`: any OpenAI-compatible `/audio/speech` endpoint, including local servers.
+
+If a provider fails, the `fallback` chain is tried in order. With `cache_dir` set, synthesized
+speech is cached by provider config, voice and text, so repeated alerts cost nothing.
+
+## Architecture
+
+```
+AirPlay receivers ─┐  (UDP/RTSP → decrypt → ALAC → resample)
+Radio / file ──────┼─▶ StreamWriter ─▶ lock-free ring ─▶ StreamSource ─┐
+                   │                                                   ├─▶ Mixer ─▶ device / null / wav
+HTTP API ─▶ AlertService (policy, TTS, decode) ─▶ bounded channel ─────┘     └─▶ pipe outputs (ffmpeg…)
+```
+
+- `engine.rs`: real-time mixer with named inputs and priority layers. It never blocks or allocates per block.
+- `stream.rs`: ring buffer, prebuffering, underrun handling, drift correction and streaming resampling.
+- `airplay/`: Bonjour advertising, RTSP, crypto, RTP/retransmission, decoding.
+- `inputs.rs`: radio/file background with ICY metadata and reconnects.
+- `taps.rs`: pipe outputs.
+- `alerts.rs`, `tts/`: alert policy and speech providers.
+- `ui.html`: the control page.
+
+`cargo test` includes an end-to-end AirPlay session: a simulated iPhone checks the
+Apple-Challenge signature, sends an RSA-wrapped key, streams encrypted ALAC, checks that a
+dropped packet is re-requested and the audio arrives bit-exact, and that a critical alert pauses
+and resumes it over DACP via a real Bonjour lookup.
+
+## Roadmap
+
+1. ~~Mixer core, priority layers, ducking, local output~~
+2. ~~Alert API and pluggable TTS~~
+3. ~~Streaming inputs: Icecast/radio with reconnects~~
+4. ~~AirPlay 1 receivers, several at once~~
+5. ~~Pipe outputs (Icecast publishing, recording)~~
+6. ~~Web control page~~
+7. ~~Pause/resume AirPlay senders during critical alerts (DACP), track metadata from AirPlay~~
+8. Possible later: AirPlay 2 (multi-room sync, HomeKit pairing), artwork

@@ -1,0 +1,97 @@
+# unsonido example config. Run with: unsonido --config unsonido.toml
+# Every section is optional; omitted values use the defaults shown here.
+
+[server]
+listen = "127.0.0.1:7700"
+# Required if you listen on a LAN address. Prefer token_env over a literal token.
+# token_env = "UNSONIDO_TOKEN"
+
+[output]
+type = "device"            # "device" | "null" | "wav"
+# name = "Vocaster"        # substring of a name from `unsonido devices`; system default if omitted
+# type = "wav"
+# path = "/tmp/unsonido.wav"
+
+[mixer]
+master_volume = 0.8
+notification_duck_db = -15.0   # bed level under notifications
+critical_duck_db = -60.0       # effectively mutes the bed under critical alerts
+attack_ms = 250                # duck ramp; alerts start after it
+release_ms = 800
+release_delay_ms = 400
+critical_min_volume = 0.7      # critical alerts raise master volume to at least this
+crossfade_ms = 1000            # background <-> foreground (AirPlay) crossfade
+
+[alerts]
+dedupe_seconds = 600           # alerts with the same `id` are ignored for this long
+max_queue = 32
+max_repeat = 5
+target_dbfs = -18.0            # speech/uploads are normalized to this RMS level
+# [alerts.quiet_hours]         # notifications dropped, critical alerts still play
+# start = "22:00"
+# end = "07:00"
+
+# Background bed: an Icecast/radio stream or a looped local file. Change it at runtime with
+# PUT /background or from the web page.
+# [background]
+# urls = [                       # tried in order; later ones are fallbacks if earlier ones fail
+#   "https://ice5.somafm.com/groovesalad-128-mp3",
+#   "https://ice1.somafm.com/groovesalad-128-mp3",
+# ]
+# file = "/Users/me/Music/ambient.mp3"   # or a local file instead of urls
+# gain_db = -6.0
+
+[airplay]
+advertise = true               # announce over Bonjour so iPhone/iPad/Mac list the speakers
+name = "Unsonido"              # one idle speaker is always available; when it's taken,
+max_receivers = 6              # "Unsonido 2", "Unsonido 3"... appear, up to this many
+idle_grace_secs = 30           # extra idle speakers disappear after this long
+base_port = 5100               # speaker N listens on base_port + N - 1 (macOS's own receiver uses 5000/7000)
+buffer_ms = 400                # buffer for senders that send no schedule; raise it on flaky Wi-Fi
+volume_range_db = 45.0         # attenuation at the bottom of the sender's volume slider
+pause_on_critical = true       # pause playing senders (DACP) during critical alerts, resume after
+
+
+# Copies of the final mix, piped as raw f32le stereo to a program. `{rate}` is the sample rate.
+# Publish the bus to an Icecast server:
+# [[pipe_outputs]]
+# name = "icecast"
+# command = ["ffmpeg", "-loglevel", "error", "-f", "f32le", "-ar", "{rate}", "-ac", "2", "-i", "pipe:0",
+#            "-c:a", "libmp3lame", "-b:a", "192k", "-content_type", "audio/mpeg", "-f", "mp3",
+#            "icecast://source:hackme@localhost:8000/unsonido"]
+
+[tts]
+default = "say"
+fallback = ["say"]             # tried in order if the requested provider fails
+cache_dir = "~/Library/Caches/unsonido/tts"
+
+# Providers are named instances; define as many as you like and pick per alert
+# with "provider": "<name>".
+
+[tts.providers.say]
+type = "say"
+# voice = "Paulina"            # `say -v '?'` lists voices
+# rate = 190
+
+# Piper (local neural TTS, works on Linux): https://github.com/rhasspy/piper
+# [tts.providers.piper]
+# type = "command"
+# command = ["piper", "--model", "/opt/piper/es_MX-claude-high.onnx", "--output_file", "{output}"]
+# stdin = true
+# extension = "wav"
+
+# [tts.providers.eleven]
+# type = "elevenlabs"
+# api_key_env = "ELEVENLABS_API_KEY"
+# voice_id = "21m00Tcm4TlvDq8ikWAM"
+# model_id = "eleven_multilingual_v2"
+# output_format = "mp3_44100_128"   # mp3_*, wav_* or pcm_*
+
+# Any OpenAI-compatible /audio/speech endpoint: OpenAI, or a local server.
+# [tts.providers.openai]
+# type = "openai"
+# base_url = "https://api.openai.com/v1"
+# api_key_env = "OPENAI_API_KEY"
+# model = "gpt-4o-mini-tts"
+# voice = "alloy"
+# instructions = "Speak calmly and clearly."
